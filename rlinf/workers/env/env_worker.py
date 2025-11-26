@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 from collections import defaultdict
 from typing import Any
 
@@ -63,6 +64,15 @@ class EnvWorker(Worker):
             self.cfg.env.eval.num_group * self.cfg.env.eval.group_size
         )
         assert self.cfg.env.train.num_envs == self.batch_size
+        self.env_world_size = self._component_placement.get_world_size("env")
+        self.batch_size_per_worker = self.batch_size // self.env_world_size
+        self.eval_batch_size_per_worker = self.eval_batch_size // self.env_world_size
+        self.train_num_group_per_worker = (
+            self.cfg.env.train.num_group // self.env_world_size
+        )
+        self.eval_num_group_per_worker = (
+            self.cfg.env.eval.num_group // self.env_world_size
+        )
 
         # only need rank0 to create channel
         if self._rank == 0:
@@ -252,6 +262,9 @@ class EnvWorker(Worker):
                 # Create a copy of maniskill config and merge with env.train
                 # First, resolve env.train with full config context, then merge
                 env_train_resolved = OmegaConf.to_container(self.cfg.env.train, resolve=True)
+                env_train_resolved = self._prepare_local_env_cfg(
+                    env_train_resolved, mode="train"
+                )
                 maniskill_cfg = OmegaConf.to_container(self.cfg.env.train.maniskill, resolve=True)
                 # Merge resolved configs
                 merged_dict = {**maniskill_cfg, **env_train_resolved}
@@ -259,6 +272,9 @@ class EnvWorker(Worker):
                 merged_dict.pop("maniskill", None)
                 merged_dict.pop("libero", None)
                 merged_dict.pop("simulator_type", None)
+                self._set_init_params_num_envs(
+                    merged_dict, mode="train", simulator_type="maniskill"
+                )
                 merged_cfg = OmegaConf.create(merged_dict)
                 if not only_eval:
                     self.simulator_list.append(
@@ -274,11 +290,17 @@ class EnvWorker(Worker):
                 # Initialize eval_simulator_list for maniskill
                 if self.cfg.runner.val_check_interval > 0 or only_eval:
                     env_eval_resolved = OmegaConf.to_container(self.cfg.env.eval, resolve=True)
+                    env_eval_resolved = self._prepare_local_env_cfg(
+                        env_eval_resolved, mode="eval"
+                    )
                     maniskill_eval_cfg = OmegaConf.to_container(self.cfg.env.eval.maniskill, resolve=True)
                     merged_eval_dict = {**maniskill_eval_cfg, **env_eval_resolved}
                     merged_eval_dict.pop("maniskill", None)
                     merged_eval_dict.pop("libero", None)
                     merged_eval_dict.pop("simulator_type", None)
+                    self._set_init_params_num_envs(
+                        merged_eval_dict, mode="eval", simulator_type="maniskill"
+                    )
                     merged_eval_cfg = OmegaConf.create(merged_eval_dict)
                     for stage_id in range(self.stage_num):
                         self.eval_simulator_list.append(
@@ -295,6 +317,9 @@ class EnvWorker(Worker):
                 # Create a copy of libero config and merge with env.train
                 # First, resolve env.train with full config context, then merge
                 env_train_resolved = OmegaConf.to_container(self.cfg.env.train, resolve=True)
+                env_train_resolved = self._prepare_local_env_cfg(
+                    env_train_resolved, mode="train"
+                )
                 libero_cfg = OmegaConf.to_container(self.cfg.env.train.libero, resolve=True)
                 # Merge resolved configs
                 merged_dict = {**libero_cfg, **env_train_resolved}
@@ -302,6 +327,9 @@ class EnvWorker(Worker):
                 merged_dict.pop("maniskill", None)
                 merged_dict.pop("libero", None)
                 merged_dict.pop("simulator_type", None)
+                self._set_init_params_num_envs(
+                    merged_dict, mode="train", simulator_type="libero"
+                )
                 merged_cfg = OmegaConf.create(merged_dict)
                 if not only_eval:
                     self.simulator_list.append(
@@ -317,11 +345,17 @@ class EnvWorker(Worker):
                 # Initialize eval_simulator_list for libero
                 if self.cfg.runner.val_check_interval > 0 or only_eval:
                     env_eval_resolved = OmegaConf.to_container(self.cfg.env.eval, resolve=True)
+                    env_eval_resolved = self._prepare_local_env_cfg(
+                        env_eval_resolved, mode="eval"
+                    )
                     libero_eval_cfg = OmegaConf.to_container(self.cfg.env.eval.libero, resolve=True)
                     merged_eval_dict = {**libero_eval_cfg, **env_eval_resolved}
                     merged_eval_dict.pop("maniskill", None)
                     merged_eval_dict.pop("libero", None)
                     merged_eval_dict.pop("simulator_type", None)
+                    self._set_init_params_num_envs(
+                        merged_eval_dict, mode="eval", simulator_type="libero"
+                    )
                     merged_eval_cfg = OmegaConf.create(merged_eval_dict)
                     for stage_id in range(self.stage_num):
                         self.eval_simulator_list.append(
@@ -478,6 +512,27 @@ class EnvWorker(Worker):
                 for i in range(self.stage_num):
                     self.eval_simulator_list[i].flush_video()
 
+    def _prepare_local_env_cfg(self, cfg_dict, mode):
+        cfg_copy = copy.deepcopy(cfg_dict)
+        if mode == "train":
+            cfg_copy["num_envs"] = self.batch_size_per_worker
+            cfg_copy["num_group"] = self.train_num_group_per_worker
+        elif mode == "eval":
+            cfg_copy["num_envs"] = self.eval_batch_size_per_worker
+            cfg_copy["num_group"] = self.eval_num_group_per_worker
+        return cfg_copy
+
+    def _set_init_params_num_envs(self, cfg_dict, mode, simulator_type):
+        needs_init_param_override = {"maniskill"}
+        if simulator_type not in needs_init_param_override:
+            return
+        target_num_envs = (
+            self.batch_size_per_worker if mode == "train" else self.eval_batch_size_per_worker
+        )
+        init_params = cfg_dict.get("init_params")
+        if isinstance(init_params, dict):
+            init_params["num_envs"] = target_num_envs
+
     def split_env_batch(self, env_batch, gather_id, mode):
         env_batch_i = {}
         for key, value in env_batch.items():
@@ -487,14 +542,14 @@ class EnvWorker(Worker):
                 ].contiguous()
             elif isinstance(value, list):
                 length = len(value)
-                if mode == "train":
-                    assert length == self.batch_size, (
-                        f"key {key}, length: {length}, batch_size: {self.batch_size}"
-                    )
-                elif mode == "eval":
-                    assert length == self.eval_batch_size, (
-                        f"key {key}, length: {length}, batch_size: {self.eval_batch_size}"
-                    )
+                expected_length = (
+                    self.batch_size_per_worker
+                    if mode == "train"
+                    else self.eval_batch_size_per_worker
+                )
+                assert length == expected_length, (
+                    f"key {key}, length: {length}, per_worker_batch_size: {expected_length}"
+                )
                 env_batch_i[key] = value[
                     gather_id * length // self.gather_num : (gather_id + 1)
                     * length
