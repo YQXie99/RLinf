@@ -43,7 +43,7 @@ def prepare_actions_for_maniskill(
 
     if policy == "google_robot":
         raise NotImplementedError
-    elif policy == "widowx_bridge":
+    elif policy == "widowx_bridge" or policy == "panda-ee-dpose":
         actions["gripper"] = 2.0 * (raw_actions["open_gripper"] > 0.5) - 1.0  # [B, 1]
 
     actions["terminate_episode"] = np.array([0.0] * batch_size).reshape(-1, 1)  # [B, 1]

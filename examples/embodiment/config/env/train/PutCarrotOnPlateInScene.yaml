@@ -27,4 +27,6 @@ init_params:
   max_episode_steps: ${env.train.max_episode_steps}
   sensor_configs:
     shader_pack: "default"
+    width: 128
+    height: 128
   render_mode: all

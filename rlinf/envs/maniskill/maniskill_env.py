@@ -126,7 +126,27 @@ class ManiskillEnv(gym.Env):
 
     def _wrap_obs(self, raw_obs):
         if self.env.obs_mode == "state":
-            wrapped_obs = {"images": None, "task_description": None, "state": raw_obs}
+            wrapped_obs = {
+                "images": None,
+                "task_description": None,
+                "states": raw_obs
+            }
+        # elif self.env.obs_mode == "rgb":
+        #     sensor_data = raw_obs.pop("sensor_data")
+        #     raw_obs.pop("sensor_param")
+        #     state = common.flatten_state_dict(
+        #         raw_obs, use_torch=True, device=self.device
+        #     )
+
+        #     images = dict()
+        #     for camera_name in sensor_data.keys():
+        #         image_tensor = sensor_data[camera_name]["rgb"] # [B, H, W, C]
+        #         images[camera_name] = image_tensor.permute(0, 3, 1, 2) # [B, C, H, W]
+        #     wrapped_obs = {
+        #         "images": images,
+        #         "task_description": None,
+        #         "states": state
+        #     }
         else:
             wrapped_obs = self._extract_obs_image(raw_obs)
         return wrapped_obs

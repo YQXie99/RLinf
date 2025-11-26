@@ -16,7 +16,7 @@ import json
 import os
 
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from transformers import (
     AutoConfig,
     AutoImageProcessor,
@@ -252,6 +252,11 @@ def get_model(model_path, cfg: DictConfig, override_config_kwargs=None):
             num_action_chunks=cfg.num_action_chunks,
             add_value_head=cfg.add_value_head,
         )
+    elif cfg.model_name == "cnn_policy":
+        from .embodiment.cnn_policy import CNNPolicy, CNNConfig
+        model_config = CNNConfig()
+        model_config.update_from_dict(OmegaConf.to_container(cfg, resolve=True))
+        model = CNNPolicy(model_config)
     elif cfg.model_name == "gr00t":
         from pathlib import Path
 

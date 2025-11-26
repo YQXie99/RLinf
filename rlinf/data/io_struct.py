@@ -1062,20 +1062,10 @@ class EnvOutput:
 
     def prepare_observations(self, obs: dict[str, Any]) -> dict[str, Any]:
         wrist_image_tensor = None
-        if self.simulator_type == "libero":
-            image_tensor = torch.stack(
-                [
-                    value.clone().permute(2, 0, 1)
-                    for value in obs["images_and_states"]["full_image"]
-                ]
-            )
-            if "wrist_image" in obs["images_and_states"]:
-                wrist_image_tensor = torch.stack(
-                    [
-                        value.clone().permute(2, 0, 1)
-                        for value in obs["images_and_states"]["wrist_image"]
-                    ]
-                )
+        if self.simulator_type == "libero" or self.simulator_type == "multi_task":
+            image_tensor = obs["images"]
+            if "wrist_image" in obs:
+                wrist_image_tensor = obs["wrist_images"]
         elif self.simulator_type == "maniskill":
             image_tensor = obs["images"]
         elif self.simulator_type == "robotwin":

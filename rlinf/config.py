@@ -43,6 +43,7 @@ SUPPORTED_MODEL_ARCHS = [
     "qwen3_moe",
     "openpi",
     "mlp_policy",
+    "cnn_policy",
     "gr00t",
 ]
 SUPPORTED_ROLLOUT_BACKENDS = ["sglang", "vllm"]
@@ -665,7 +666,11 @@ def validate_embodied_cfg(cfg):
                 elif "widowx" in robot:
                     return "arm_pd_ee_target_delta_pose_align2_gripper_pd_joint_pos"
                 elif "panda-qpos" in robot:
-                    return None
+                    return "pd_joint_delta_pos"
+                elif "panda-ee-dpose" in robot:
+                    return "pd_ee_delta_pose"
+                elif "panda-ee-dpos" in robot:
+                    return "pd_ee_delta_pos"
                 else:
                     raise NotImplementedError(f"Robot {robot} not supported")
 
@@ -675,6 +680,42 @@ def validate_embodied_cfg(cfg):
             cfg.env.eval.init_params.control_mode = get_robot_control_mode(
                 cfg.actor.model.policy_setup
             )
+        elif cfg.env.train.simulator_type == "multi_task":
+            # For multi_task, we need to set control_mode for maniskill environments
+            def get_robot_control_mode(robot: str):
+                if "google_robot_static" in robot:
+                    return "arm_pd_ee_delta_pose_align_interpolate_by_planner_gripper_pd_joint_target_delta_pos_interpolate_by_planner"
+                elif "widowx" in robot:
+                    return "arm_pd_ee_target_delta_pose_align2_gripper_pd_joint_pos"
+                elif "panda-qpos" in robot:
+                    return None
+                else:
+                    raise NotImplementedError(f"Robot {robot} not supported")
+            
+            # Determine control_mode based on maniskill environment ID
+            # Environments using WidowX250SBridgeDatasetFlatTable need widowx control_mode
+            if hasattr(cfg.env.train, "maniskill") and hasattr(cfg.env.train.maniskill, "init_params"):
+                maniskill_env_id = cfg.env.train.maniskill.init_params.get("id", "")
+                # PutOnPlateInScene environments use WidowX250SBridgeDatasetFlatTable robot
+                if "PutOnPlateInScene" in maniskill_env_id:
+                    cfg.env.train.maniskill.init_params.control_mode = get_robot_control_mode("widowx")
+                # If control_mode is explicitly None and policy_setup is set, use policy_setup
+                elif cfg.env.train.maniskill.init_params.get("control_mode") is None:
+                    if hasattr(cfg.actor.model, "policy_setup"):
+                        cfg.env.train.maniskill.init_params.control_mode = get_robot_control_mode(
+                            cfg.actor.model.policy_setup
+                        )
+            
+            # Same for eval config
+            if hasattr(cfg.env, "eval") and hasattr(cfg.env.eval, "maniskill") and hasattr(cfg.env.eval.maniskill, "init_params"):
+                maniskill_env_id = cfg.env.eval.maniskill.init_params.get("id", "")
+                if "PutOnPlateInScene" in maniskill_env_id:
+                    cfg.env.eval.maniskill.init_params.control_mode = get_robot_control_mode("widowx")
+                elif cfg.env.eval.maniskill.init_params.get("control_mode") is None:
+                    if hasattr(cfg.actor.model, "policy_setup"):
+                        cfg.env.eval.maniskill.init_params.control_mode = get_robot_control_mode(
+                            cfg.actor.model.policy_setup
+                        )
         elif cfg.env.train.simulator_type == "libero":
             if cfg.actor.model.get("num_images_in_input", 1) > 1:
                 assert cfg.actor.model.get("use_wrist_image", False), (

@@ -24,5 +24,5 @@ video_cfg:
   video_base_dir: ${runner.logger.log_path}/video/eval
 
 init_params:
-  camera_heights: 256
-  camera_widths: 256
+  camera_heights: 128
+  camera_widths: 128

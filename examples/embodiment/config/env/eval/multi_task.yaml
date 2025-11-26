@@ -1,0 +1,52 @@
+simulator_type: multi_task
+auto_reset: ${algorithm.auto_reset}
+ignore_terminations: ${algorithm.ignore_terminations}
+use_rel_reward: True
+num_group: ${algorithm.num_group_envs}
+group_size: ${algorithm.group_size}
+use_fixed_reset_state_ids: ${algorithm.use_fixed_reset_state_ids}
+num_envs: ${multiply:${algorithm.group_size}, ${algorithm.num_group_envs}}
+only_eval: False
+max_episode_steps: ${algorithm.max_episode_steps}
+reward_coef: ${algorithm.reward_coef}
+use_wrist_image: ${actor.model.use_wrist_image}
+
+video_cfg:
+  save_video: True
+  info_on_video: True
+  video_base_dir: ${runner.logger.log_path}/video/train
+
+maniskill:
+  simulator_type: maniskill
+  seed: 0
+
+  max_episode_steps: 80
+
+  init_params:
+    id: PutOnPlateInScene25Main-v3
+    num_envs: ${multiply:${algorithm.group_size}, ${algorithm.num_group_envs}}
+    obs_mode: "rgb+segmentation"
+    control_mode: None
+    sim_backend: "gpu"
+    sim_config:
+      sim_freq: 500
+      control_freq: 5
+    max_episode_steps: ${env.train.maniskill.max_episode_steps}
+    sensor_configs:
+      shader_pack: "default"
+      width: 128
+      height: 128
+    render_mode: all
+    obj_set: train
+
+libero:
+  simulator_type: libero
+  task_suite_name: libero_130
+
+  seed: 0
+
+  init_params:
+    camera_heights: 128
+    camera_widths: 128
+
+  use_ordered_reset_state_ids: ${algorithm.use_ordered_reset_state_ids}

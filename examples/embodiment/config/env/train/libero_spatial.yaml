@@ -25,7 +25,7 @@ video_cfg:
   video_base_dir: ${runner.logger.log_path}/video/train
 
 init_params:
-  camera_heights: 256
-  camera_widths: 256
+  camera_heights: 128
+  camera_widths: 128
 
 use_ordered_reset_state_ids: ${algorithm.use_ordered_reset_state_ids}

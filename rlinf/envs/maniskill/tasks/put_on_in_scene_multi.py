@@ -40,7 +40,7 @@ CARROT_DATASET_DIR = Path(__file__).parent / ".." / "assets" / "carrot"
 class PutOnPlateInScene25(BaseEnv):
     """Base Digital Twin environment for digital twins of the BridgeData v2"""
 
-    SUPPORTED_OBS_MODES = ["rgb+segmentation"]
+    SUPPORTED_OBS_MODES = ["rgb+segmentation", "state"]
     SUPPORTED_REWARD_MODES = ["none"]
 
     obj_static_friction = 1.0
@@ -51,12 +51,14 @@ class PutOnPlateInScene25(BaseEnv):
         "background"  # 'background' or 'object' or 'debug' or combinations of them
     )
 
-    overlay_images_numpy: list[np.ndarray]
-    overlay_images_hw = (480, 640)
+    overlay_images_source_numpy: list[np.ndarray]
+    overlay_images_numpy: list[np.ndarray] | None = None
+    overlay_images_hw: tuple[int, int] | None = None
     overlay_images: torch.Tensor
 
-    overlay_textures_numpy: list[np.ndarray]
-    overlay_texture_hw = (480, 640)
+    overlay_textures_source_numpy: list[np.ndarray]
+    overlay_textures_numpy: list[np.ndarray] | None = None
+    overlay_texture_hw: tuple[int, int] | None = None
     overlay_textures: torch.Tensor
 
     overlay_mix_numpy: list[float]
@@ -294,6 +296,12 @@ class PutOnPlateInScene25(BaseEnv):
 
     def _reset_overlay(self, env_idx):
         # Handle overlay tensors for full vs partial reset - Keep full size for get_obs() method
+        if (
+            self.overlay_images_hw is None
+            or self.overlay_images_numpy is None
+            or self.overlay_textures_numpy is None
+        ):
+            raise RuntimeError("Overlay assets not initialized for current resolution.")
         overlay_images = np.stack(
             [self.overlay_images_numpy[idx] for idx in self.select_overlay_ids[env_idx]]
         )
@@ -306,7 +314,11 @@ class PutOnPlateInScene25(BaseEnv):
         overlay_mix = np.array(
             [self.overlay_mix_numpy[idx] for idx in self.select_overlay_ids[env_idx]]
         )
-        if not hasattr(self, "overlay_images") or len(env_idx) == self.num_envs:
+        if (
+            not hasattr(self, "overlay_images")
+            or len(env_idx) == self.num_envs
+            or self.overlay_images.shape[1:3] != self.overlay_images_hw
+        ):
             self.overlay_images = torch.zeros(
                 (self.num_envs, *self.overlay_images_hw, 3), device=self.device
             )
@@ -314,7 +326,11 @@ class PutOnPlateInScene25(BaseEnv):
         self.overlay_images[env_idx] = torch.tensor(
             overlay_images, device=self.device, dtype=torch.float32
         )
-        if not hasattr(self, "overlay_textures") or len(env_idx) == self.num_envs:
+        if (
+            not hasattr(self, "overlay_textures")
+            or len(env_idx) == self.num_envs
+            or self.overlay_textures.shape[1:3] != self.overlay_texture_hw
+        ):
             self.overlay_textures = torch.zeros(
                 (self.num_envs, *self.overlay_texture_hw, 3),
                 device=self.device,
@@ -332,6 +348,29 @@ class PutOnPlateInScene25(BaseEnv):
         self.overlay_mix[env_idx] = torch.tensor(
             overlay_mix, device=self.device, dtype=torch.float32
         )
+
+    def _ensure_overlay_resolution(self, width: int, height: int):
+        if not hasattr(self, "overlay_images_source_numpy"):
+            return
+
+        target_hw = (height, width)
+        if (
+            self.overlay_images_hw == target_hw
+            and self.overlay_images_numpy is not None
+            and self.overlay_textures_numpy is not None
+        ):
+            return
+
+        self.overlay_images_hw = target_hw
+        self.overlay_texture_hw = target_hw
+
+        self.overlay_images_numpy = [
+            cv2.resize(img, (width, height)) for img in self.overlay_images_source_numpy
+        ]
+        self.overlay_textures_numpy = [
+            cv2.resize(tex, (width, height))
+            for tex in self.overlay_textures_source_numpy
+        ]
 
     def _reset_bbox(
         self, env_idx, carrot_actor, plate_actor, select_carrot, select_plate
@@ -443,8 +482,7 @@ class PutOnPlateInScene25(BaseEnv):
 
         # rgb overlay
         sensor = self._sensor_configs[self.rgb_camera_name]
-        assert sensor.width == 640
-        assert sensor.height == 480
+        self._ensure_overlay_resolution(sensor.width, sensor.height)
         self._reset_overlay(env_idx)
 
         # xyz and quat
@@ -839,19 +877,13 @@ class PutOnPlateInScene25MainV3(PutOnPlateInScene25):
 
         img_fd = CARROT_DATASET_DIR / "more_table" / "imgs"
         texture_fd = CARROT_DATASET_DIR / "more_table" / "textures"
-        self.overlay_images_numpy = [
-            cv2.resize(
-                cv2.cvtColor(cv2.imread(str(img_fd / k)), cv2.COLOR_BGR2RGB),
-                (self.overlay_images_hw[1], self.overlay_images_hw[0]),
-            )
+        self.overlay_images_source_numpy = [
+            cv2.cvtColor(cv2.imread(str(img_fd / k)), cv2.COLOR_BGR2RGB)
             for k in model_db_table  # [H, W, 3]
         ]  # (B) [H, W, 3]
-        self.overlay_textures_numpy = [
-            cv2.resize(
-                cv2.cvtColor(
-                    cv2.imread(str(texture_fd / v["texture"])), cv2.COLOR_BGR2RGB
-                ),
-                (self.overlay_texture_hw[1], self.overlay_texture_hw[0]),
+        self.overlay_textures_source_numpy = [
+            cv2.cvtColor(
+                cv2.imread(str(texture_fd / v["texture"])), cv2.COLOR_BGR2RGB
             )
             for v in model_db_table.values()  # [H, W, 3]
         ]  # (B) [H, W, 3]
@@ -859,9 +891,13 @@ class PutOnPlateInScene25MainV3(PutOnPlateInScene25):
             v["mix"]
             for v in model_db_table.values()  # []
         ]
-        assert len(self.overlay_images_numpy) == 21
-        assert len(self.overlay_textures_numpy) == 21
+        assert len(self.overlay_images_source_numpy) == 21
+        assert len(self.overlay_textures_source_numpy) == 21
         assert len(self.overlay_mix_numpy) == 21
+        self.overlay_images_numpy = None
+        self.overlay_textures_numpy = None
+        self.overlay_images_hw = None
+        self.overlay_texture_hw = None
 
     @property
     def total_num_trials(self):
