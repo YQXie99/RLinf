@@ -16,7 +16,7 @@ cluster:
     actor,env,rollout: all
 
 runner:
-  task_type: embodied
+  task_type: 2
   logger:
     log_path: "../results"
     project_name: rlinf
