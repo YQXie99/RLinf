@@ -1,7 +1,7 @@
 defaults:
-  - env/metaworld_50@env.train
-  - env/metaworld_50@env.eval
-  - model/pi0_5@actor.model
+  - env/metaworld_10@env.train
+  - env/metaworld_10@env.eval
+  - model/cnn_policy@actor.model
   - training_backend/fsdp@actor.fsdp_config
   - override hydra/job_logging: stdout
 
@@ -22,7 +22,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "metaworld_50_ppo_openpi_pi05"
+    experiment_name: "metaworld_10_ppo_cnn"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
   max_epochs: 1000
@@ -42,10 +42,10 @@ algorithm:
   reward_coef: 1.0
   # Whether to enable PCGrad-based multi-task gradient projection.
   # Default is False to keep behavior identical to vanilla PPO.
-  use_pcgrad: False
+  use_pcgrad: True
 
   # Rollout epochs per train step; keep small to control memory.
-  rollout_epoch: 8
+  rollout_epoch: 1
   eval_rollout_epoch: 1 # set eval_rollout_epoch > 0 when enable runner.only_eval or runner.val_check_interval > 0
 
   reward_type: chunk_level
@@ -92,12 +92,11 @@ env:
   group_name: "EnvGroup"
   enable_offload: False
 
-  # Override the default values in env/metaworld_50
+  # Override the default values in env/metaworld_10
   train:
-    # Reduce number of parallel envs to save memory.
-    total_num_envs: 64
+    total_num_envs: 512
   eval:
-    total_num_envs: 500
+    total_num_envs: 200
     auto_reset: True
     ignore_terminations: True
     max_episode_steps: 100
@@ -111,8 +110,6 @@ env:
 rollout:
   group_name: "RolloutGroup"
   generation_backend: "huggingface"
-  recompute_logprobs: False
-  unnorm_key: libero_10
   enable_offload: False
   pipeline_stage_num: 1
   # Enable transition collection so that observations (including task_ids)
@@ -120,33 +117,31 @@ rollout:
   collect_transitions: True
 
   model:
-    model_path: /mnt/project_rlinf/chenkang/RLinf_codes/RLinf_fork_metaworld/logs/metaworld_50_ppo_openpi_pi05_100_20251111-15:51:55/test_openpi_pt/checkpoints/global_step_450
+    model_path: /mnt/project_rlinf/hongzhi/models/  # 请替换为实际的 ResNet 预训练权重路径
+    state_dim: 4
+    action_dim: 4
+    image_num: 1
     precision: ${actor.model.precision}
 
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
   # Per-rank micro-batch size; keep moderate to balance memory & throughput.
-  micro_batch_size: 128
+  micro_batch_size: 256
   # Global batch size across all actor ranks.
-  # 约束 1：global_batch_size % (micro_batch_size * actor_world_size) == 0
-  # 约束 2：rollout_size % (global_batch_size / actor_world_size) == 0
-  # 对当前设置（world_size=8, rollout_size≈80），128 是一个满足约束且不易 OOM 的折中值。
   global_batch_size: 2048
   seed: 42
   enable_offload: False
 
-  # Override the default values in model/pi0_5
+  # Override the default values in model/cnn_policy (PPO actor_critic)
   model:
-    model_path: /mnt/project_rlinf/chenkang/RLinf_codes/RLinf_fork_metaworld/logs/metaworld_50_ppo_openpi_pi05_100_20251111-15:51:55/test_openpi_pt/checkpoints/global_step_450
-    num_action_chunks: 5 # interface for the env
+    model_path: /mnt/project_rlinf/hongzhi/models/   # 请替换为实际的 ResNet 预训练权重路径
+    state_dim: 4  # metaworld 观测 state 维度 (obs[:, :4])
     action_dim: 4
-    add_value_head: True
-    # openpi specific parameters
-    openpi:
-      config_name: "pi05_metaworld"
-      num_images_in_input: 1
-      value_after_vlm: True
+    num_action_chunks: 1
+    add_value_head: True  # PPO actor_critic 需要 value head
+    add_q_head: False
+    image_num: 1
 
   optim:
     lr: 5.0e-6
@@ -168,7 +163,7 @@ actor:
     # 使用 no_shard，避免 Torch Autograd 在 full_shard + autograd.grad 组合下的 storage 越界问题。
     # 我们通过减小 batch / env / rollout_epoch 来控制显存。
     sharding_strategy: "no_shard"
-    gradient_checkpointing: False # for openpi, gradient checkpointing is not supported, please do not change this value
+    gradient_checkpointing: False
     mixed_precision:
       param_dtype: ${actor.model.precision}
       reduce_dtype: ${actor.model.precision}
@@ -179,3 +174,4 @@ reward:
 
 critic:
   use_critic_model: False
+

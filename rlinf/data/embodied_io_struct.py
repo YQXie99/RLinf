@@ -83,6 +83,7 @@ class EnvOutput:
         task_descriptions = (
             list(obs["task_descriptions"]) if "task_descriptions" in obs else None
         )
+        task_ids = obs["task_ids"] if "task_ids" in obs else None
 
         return {
             "main_images": image_tensor,  # [N_ENV, H, W, C]
@@ -90,6 +91,8 @@ class EnvOutput:
             "extra_view_images": extra_view_image_tensor,  # [N_ENV, N_IMG, H, W, C]
             "states": states,
             "task_descriptions": task_descriptions,
+            # Shape: [N_ENV], dtype: int64
+            "task_ids": task_ids,
         }
 
     def to_dict(self):

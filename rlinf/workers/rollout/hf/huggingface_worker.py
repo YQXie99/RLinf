@@ -111,6 +111,12 @@ class MultiStepRolloutWorker(Worker):
 
     @Worker.timer("predict")
     def predict(self, env_obs, mode="train"):
+        # IMPORTANT: some model implementations may mutate `env_obs` in-place
+        # (e.g. pop keys). We keep rollout observations intact by passing a
+        # shallow copy to the model.
+        if isinstance(env_obs, dict):
+            env_obs = env_obs.copy()
+
         kwargs = (
             self._train_sampling_params
             if mode == "train"

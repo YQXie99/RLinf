@@ -768,6 +768,9 @@ def validate_embodied_cfg(cfg):
         )
 
     with open_dict(cfg):
+        # Optional multi-task gradient conflict handling (e.g., PCGrad)
+        cfg.algorithm.use_pcgrad = cfg.algorithm.get("use_pcgrad", False)
+
         weight_sync_interval = cfg.runner.get("weight_sync_interval", 1)
         assert weight_sync_interval > 0, "weight_sync_interval must be greater than 0"
         cfg.runner.weight_sync_interval = weight_sync_interval

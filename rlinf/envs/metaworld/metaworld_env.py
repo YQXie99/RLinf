@@ -232,12 +232,16 @@ class MetaWorldEnv(gym.Env):
 
     def _record_metrics(self, step_reward, terminations, infos):
         episode_info = {}
+        # Per-env metrics
         self.returns += step_reward
         self.success_once = self.success_once | terminations
         episode_info["success_once"] = self.success_once.copy()
         episode_info["return"] = self.returns.copy()
         episode_info["episode_len"] = self.elapsed_steps.copy()
         episode_info["reward"] = episode_info["return"] / episode_info["episode_len"]
+        # Expose task ids so that downstream metrics can compute per-task stats
+        # Shape: [num_envs], dtype: int
+        episode_info["task_id"] = self.task_ids.copy()
         infos["episode"] = to_tensor(episode_info)
         return infos
 
@@ -276,6 +280,10 @@ class MetaWorldEnv(gym.Env):
             "states": states,
             "task_descriptions": self.task_descriptions,
         }
+        # Expose per-env task ids in observations so that they can be propagated
+        # through rollout → actor for multi-task training (e.g. PCGrad).
+        # Shape: [num_envs], dtype: int64
+        obs["task_ids"] = torch.as_tensor(self.task_ids, dtype=torch.long)
         return obs
 
     def _reconfigure(self, reset_state_ids, env_idx):

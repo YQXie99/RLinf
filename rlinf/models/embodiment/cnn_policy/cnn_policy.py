@@ -19,6 +19,7 @@ from typing import Any, Optional
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributions.normal import Normal
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
@@ -183,10 +184,27 @@ class CNNPolicy(nn.Module, BasePolicy):
         processed_env_obs = {}
         processed_env_obs["states"] = env_obs["states"].clone().to(device)
         x = env_obs["main_images"].clone().to(device).float() / 255.0
+        # Resize to expected image_size; ResNet encoder uses fixed spatial dims.
+        target_h, target_w = self.cfg.image_size[1], self.cfg.image_size[2]
+        if x.shape[1] != target_h or x.shape[2] != target_w:
+            x = x.permute(0, 3, 1, 2)
+            x = F.interpolate(
+                x, size=(target_h, target_w), mode="bilinear", align_corners=False
+            )
+            x = x.permute(0, 2, 3, 1)
         processed_env_obs["main_images"] = (x - mean) / std
 
         if env_obs.get("extra_view_images", None) is not None:
             ex = env_obs["extra_view_images"].clone().to(device).float() / 255.0
+            # ex: [B, N, H, W, C]
+            if ex.shape[2] != target_h or ex.shape[3] != target_w:
+                b, n, h, w, c = ex.shape
+                ex = ex.permute(0, 1, 4, 2, 3).reshape(-1, c, h, w)
+                ex = F.interpolate(
+                    ex, size=(target_h, target_w),
+                    mode="bilinear", align_corners=False,
+                )
+                ex = ex.view(b, n, c, target_h, target_w).permute(0, 1, 3, 4, 2)
             ex = (ex - mean.unsqueeze(1)) / std.unsqueeze(1)
             processed_env_obs["extra_view_images"] = ex
 

@@ -60,7 +60,7 @@ def compute_evaluate_metrics(eval_metrics_list):
     Returns:
         dict: Aggregated metrics with mean values and trajectory count
     """
-    all_eval_metrics = {}
+    all_eval_metrics: dict[str, torch.Tensor | float] = {}
     env_info_keys = eval_metrics_list[0].keys()
 
     # Count trajectories from each process
@@ -70,20 +70,35 @@ def compute_evaluate_metrics(eval_metrics_list):
         count = count_trajectories(eval_metrics)
         trajectory_counts.append(count)
 
+    # First, aggregate each raw metric by concatenation
     for env_info_key in env_info_keys:
-        all_eval_metrics[env_info_key] = [
-            eval_metrics[env_info_key] for eval_metrics in eval_metrics_list
-        ]
-
-    for key in all_eval_metrics:
-        all_eval_metrics[key] = (
-            torch.concat(all_eval_metrics[key]).float().mean().numpy()
+        all_eval_metrics[env_info_key] = torch.concat(
+            [eval_metrics[env_info_key] for eval_metrics in eval_metrics_list]
         )
 
-    # Add total trajectory count to metrics
-    all_eval_metrics["num_trajectories"] = sum(trajectory_counts)
+    # Compute overall mean for each metric
+    mean_eval_metrics: dict[str, float] = {}
+    for key, tensor_val in all_eval_metrics.items():
+        # tensor_val is expected to be 1D or easily flattenable
+        mean_eval_metrics[key] = tensor_val.float().mean().item()
 
-    return all_eval_metrics
+    # If task_id 和 success_once 同时存在，额外计算按 task 划分的成功率
+    if "task_id" in all_eval_metrics and "success_once" in all_eval_metrics:
+        task_ids = all_eval_metrics["task_id"].long()
+        successes = all_eval_metrics["success_once"].float()
+
+        unique_task_ids = torch.unique(task_ids)
+        for tid in unique_task_ids.tolist():
+            mask = task_ids == tid
+            if mask.any():
+                task_success = successes[mask].mean().item()
+                # 记录为 success_once/task_<id>，便于在 logger 中区分
+                mean_eval_metrics[f"success_once/task_{int(tid)}"] = task_success
+
+    # Add total trajectory count to metrics
+    mean_eval_metrics["num_trajectories"] = sum(trajectory_counts)
+
+    return mean_eval_metrics
 
 
 def compute_rollout_metrics(data_buffer: dict) -> dict:
@@ -335,6 +350,36 @@ def print_metrics_table(
 
             # Section separator (minimal)
             print(f"│{' ' * (table_width - 2)}│")
+
+    # Extra section: per-task success rates (env/eval)
+    per_task_success: dict[str, float] = {}
+    for key, value in metrics.items():
+        # Match keys like "env/success_once/task_0" or "eval/success_once/task_1"
+        if "success_once/task_" in key:
+            parts = key.split("/", 1)
+            task_part = parts[-1]  # e.g. "success_once/task_0"
+            try:
+                per_task_success[task_part] = float(value)
+            except (TypeError, ValueError):
+                continue
+
+    if per_task_success:
+        _print_section_title("Per-task Success")
+        print(f"│{' ' * (table_width - 2)}│")
+
+        def _task_sort_key(name: str) -> int:
+            # name: "success_once/task_0" -> 0
+            idx = name.rsplit("_", 1)[-1]
+            try:
+                return int(idx)
+            except ValueError:
+                return 0
+
+        for name, val in sorted(per_task_success.items(), key=lambda kv: _task_sort_key(kv[0])):
+            display = f"{name}={val:.3f}"
+            line = f"│{_fit_cell(display, table_width - 2)}│"
+            print(line)
+        print(f"│{' ' * (table_width - 2)}│")
 
     # Bottom border
     print(f"╰{'─' * (table_width - 2)}╯")

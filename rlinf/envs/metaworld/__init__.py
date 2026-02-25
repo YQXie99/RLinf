@@ -22,6 +22,7 @@ class MetaWorldBenchmark:
             "metaworld_50",
             "metaworld_45_ind",
             "metaworld_45_ood",
+            "metaworld_10",
         ]
         self.task_suite_name = task_suite_name
         config_path = os.path.join(os.path.dirname(__file__), "metaworld_config.json")
@@ -29,6 +30,19 @@ class MetaWorldBenchmark:
             config_path, "TASK_DESCRIPTIONS"
         )
         self.ML45_dict = load_prompt_from_json(config_path, "ML45")
+        # MT10 official task set from MetaWorld (v3 names).
+        self.MT10_envs = [
+            "reach-v3",
+            "push-v3",
+            "pick-place-v3",
+            "door-open-v3",
+            "door-close-v3",
+            "drawer-open-v3",
+            "drawer-close-v3",
+            "button-press-topdown-v3",
+            "peg-insert-side-v3",
+            "window-open-v3",
+        ]
 
     def get_num_tasks(self):
         if self.task_suite_name == "metaworld_50":
@@ -37,6 +51,8 @@ class MetaWorldBenchmark:
             return 45
         elif self.task_suite_name == "metaworld_45_ood":
             return 5
+        elif self.task_suite_name == "metaworld_10":
+            return 10
 
     def get_task_num_trials(self):
         if self.task_suite_name == "metaworld_50":
@@ -45,6 +61,9 @@ class MetaWorldBenchmark:
             return 10
         elif self.task_suite_name == "metaworld_45_ood":
             return 20
+        elif self.task_suite_name == "metaworld_10":
+            # Use the same number of trials as metaworld_50 for now.
+            return 10
 
     def get_env_names(self):
         if self.task_suite_name == "metaworld_50":
@@ -53,6 +72,8 @@ class MetaWorldBenchmark:
             return self.ML45_dict["train"]
         elif self.task_suite_name == "metaworld_45_ood":
             return self.ML45_dict["test"]
+        elif self.task_suite_name == "metaworld_10":
+            return self.MT10_envs
 
     def get_task_description(self):
         task_descriptions = []

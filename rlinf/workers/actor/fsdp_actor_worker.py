@@ -83,6 +83,7 @@ from rlinf.utils.utils import (
     retrieve_model_state_dict_in_cpu,
 )
 from rlinf.workers.rollout.utils import RankMapper
+from rlinf.algorithms.pcgrad import apply_pcgrad
 
 
 def process_nested_dict_for_adv(nested_dict, rollout_epoch):
@@ -1086,6 +1087,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         rollout_epoch = self.cfg.algorithm.rollout_epoch
         rollout_batch = process_nested_dict_for_adv(rollout_batch, rollout_epoch)
 
+        # Propagate task ids (if available) to top-level so that training code
+        # (e.g., PCGrad) can access them easily.
+        curr_obs = rollout_batch.get("curr_obs", None)
+        if isinstance(curr_obs, dict) and "task_ids" in curr_obs:
+            # Shape: [n_chunk_step, batch]
+            rollout_batch["task_ids"] = curr_obs["task_ids"]
+
         if (
             not self.cfg.env.train.auto_reset
             and not self.cfg.env.train.ignore_terminations
@@ -1204,6 +1212,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.rollout_batch = process_nested_dict_for_train(
                 self.rollout_batch, shuffle_id
             )
+            # Ensure task_ids is at top level for PCGrad (in case it only exists in curr_obs after shuffle).
+            if "task_ids" not in self.rollout_batch:
+                curr_obs = self.rollout_batch.get("curr_obs")
+                if isinstance(curr_obs, dict) and "task_ids" in curr_obs:
+                    self.rollout_batch["task_ids"] = curr_obs["task_ids"]
 
         assert (
             self.cfg.actor.global_batch_size
@@ -1232,54 +1245,218 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 rollout_size // batch_size_per_rank,
             )
             for train_global_batch in rollout_dataloader_iter:
-                # split batch into micro_batches
-                train_global_batch_size = train_global_batch["prev_logprobs"].shape[0]
-                assert (
-                    train_global_batch_size
-                    == self.cfg.actor.global_batch_size
-                    // torch.distributed.get_world_size()
-                )
-                assert train_global_batch_size % self.cfg.actor.micro_batch_size == 0, (
-                    f"{train_global_batch_size=}, {self.cfg.actor.micro_batch_size}"
-                )
+                use_pcgrad = self.cfg.algorithm.get("use_pcgrad", False)
 
-                train_micro_batch = split_dict_to_chunk(
-                    train_global_batch,
-                    train_global_batch_size // self.cfg.actor.micro_batch_size,
-                )
+                if not use_pcgrad:
+                    # ---------------- Standard PPO training path ----------------
+                    # split batch into micro_batches
+                    train_global_batch_size = train_global_batch["prev_logprobs"].shape[
+                        0
+                    ]
+                    assert (
+                        train_global_batch_size
+                        == self.cfg.actor.global_batch_size
+                        // torch.distributed.get_world_size()
+                    )
+                    assert (
+                        train_global_batch_size
+                        % self.cfg.actor.micro_batch_size
+                        == 0
+                    ), (
+                        f"{train_global_batch_size=}, {self.cfg.actor.micro_batch_size}"
+                    )
 
-                self.optimizer.zero_grad()
-                for idx, batch in enumerate(train_micro_batch):
+                    train_micro_batch = split_dict_to_chunk(
+                        train_global_batch,
+                        train_global_batch_size // self.cfg.actor.micro_batch_size,
+                    )
+
+                    self.optimizer.zero_grad()
+                    for idx, batch in enumerate(train_micro_batch):
+                        batch = put_tensor_device(
+                            batch, f"cuda:{int(os.environ['LOCAL_RANK'])}"
+                        )
+                        backward_ctx = self.before_micro_batch(
+                            self.model,
+                            is_last_micro_batch=(
+                                idx + 1
+                            )
+                            == self.gradient_accumulation,
+                        )
+                        advantages = batch["advantages"]
+                        prev_logprobs = batch["prev_logprobs"]
+                        returns = batch.get("returns", None)
+                        prev_values = batch.get("prev_values", None)
+                        loss_mask = batch.get("loss_mask", None)
+                        loss_mask_sum = batch.get("loss_mask_sum", None)
+
+                        forward_inputs = batch.get("forward_inputs", None)
+
+                        kwargs = {}
+                        if SupportedModel(self.cfg.actor.model.model_type) in [
+                            SupportedModel.OPENVLA,
+                            SupportedModel.OPENVLA_OFT,
+                        ]:
+                            kwargs["temperature"] = (
+                                self.cfg.algorithm.sampling_params.temperature_train
+                            )
+                            kwargs["top_k"] = self.cfg.algorithm.sampling_params.top_k
+                        elif (
+                            SupportedModel(self.cfg.actor.model.model_type)
+                            == SupportedModel.GR00T
+                        ):
+                            kwargs["prev_logprobs"] = prev_logprobs
+
+                        compute_values = (
+                            True if self.cfg.algorithm.adv_type == "gae" else False
+                        )
+
+                        with self.amp_context:
+                            output_dict = self.model(
+                                forward_inputs=forward_inputs,
+                                compute_logprobs=True,
+                                compute_entropy=self.cfg.algorithm.entropy_bonus > 0,
+                                compute_values=compute_values,
+                                use_cache=False,
+                                **kwargs,
+                            )
+
+                        if (
+                            SupportedModel(self.cfg.actor.model.model_type)
+                            == SupportedModel.GR00T
+                        ):
+                            prev_logprobs = output_dict["prev_logprobs"]
+
+                        kwargs = {
+                            "loss_type": self.cfg.algorithm.loss_type,
+                            "logprob_type": self.cfg.algorithm.logprob_type,
+                            "reward_type": self.cfg.algorithm.reward_type,
+                            "single_action_dim": self.cfg.actor.model.get(
+                                "action_dim", 7
+                            ),
+                            "logprobs": output_dict["logprobs"],
+                            "values": output_dict.get("values", None),
+                            "old_logprobs": prev_logprobs,
+                            "advantages": advantages,
+                            "returns": returns,
+                            "prev_values": prev_values,
+                            "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
+                            "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
+                            "value_clip": self.cfg.algorithm.get("value_clip", None),
+                            "huber_delta": self.cfg.algorithm.get(
+                                "huber_delta", None
+                            ),
+                            "loss_mask": loss_mask,
+                            "loss_mask_sum": loss_mask_sum,
+                            "max_episode_steps": self.cfg.env.train.max_episode_steps,
+                            "task_type": self.cfg.runner.task_type,
+                            "critic_warmup": self.optimizer_steps
+                            < self.critic_warmup_steps,
+                        }
+                        loss, metrics_data = policy_loss(**kwargs)
+
+                        entropy_loss = torch.tensor(
+                            0.0, device=torch.cuda.current_device()
+                        )
+                        if (
+                            self.cfg.algorithm.entropy_bonus > 0
+                            and not kwargs["critic_warmup"]
+                        ):
+                            entropy = output_dict["entropy"]
+                            entropy = reshape_entropy(
+                                entropy,
+                                entropy_type=self.cfg.algorithm.entropy_type,
+                                action_dim=self.cfg.actor.model.get("action_dim", 7),
+                                batch_size=output_dict["logprobs"].shape[0],
+                            )
+                            entropy_loss = masked_mean(entropy, mask=loss_mask)
+                            loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
+                        metrics_data["actor/entropy_loss"] = (
+                            entropy_loss.detach().item()
+                        )
+
+                        loss /= self.gradient_accumulation
+                        with backward_ctx:
+                            self.grad_scaler.scale(loss).backward()
+
+                        metrics_data["actor/total_loss"] = loss.detach().item()
+                        append_to_dict(metrics, metrics_data)
+
+                    torch.cuda.empty_cache()
+
+                    grad_norm, lr_list = self.optimizer_step()
+                    data = {
+                        "actor/grad_norm": grad_norm,
+                        "actor/lr": lr_list[0],
+                    }
+                    if len(lr_list) > 1:
+                        data["critic/lr"] = lr_list[1]
+                    append_to_dict(metrics, data)
+                else:
+                    # ---------------- PCGrad multi-task training path ----------------
+                    # Use the entire global batch (per rank) to compute per-task gradients,
+                    # apply PCGrad, then perform a single optimizer step.
                     batch = put_tensor_device(
-                        batch, f"cuda:{int(os.environ['LOCAL_RANK'])}"
+                        train_global_batch, f"cuda:{int(os.environ['LOCAL_RANK'])}"
                     )
-                    backward_ctx = self.before_micro_batch(
-                        self.model,
-                        is_last_micro_batch=(idx + 1) == self.gradient_accumulation,
-                    )
+
                     advantages = batch["advantages"]
                     prev_logprobs = batch["prev_logprobs"]
                     returns = batch.get("returns", None)
                     prev_values = batch.get("prev_values", None)
                     loss_mask = batch.get("loss_mask", None)
-                    loss_mask_sum = batch.get("loss_mask_sum", None)
+                    # loss_mask_sum is not used in PCGrad path; we treat each task
+                    # as an independent objective.
 
                     forward_inputs = batch.get("forward_inputs", None)
 
-                    kwargs = {}
+                    # Task ids: shape [B] – each timestep/env sample has a task id.
+                    task_ids = batch.get("task_ids", None)
+                    if task_ids is None:
+                        curr_obs = batch.get("curr_obs", None)
+                        if isinstance(curr_obs, dict) and "task_ids" in curr_obs:
+                            task_ids = curr_obs["task_ids"]
+
+                    if task_ids is None:
+                        # Fallback: use a single task id for all samples so PCGrad runs without error
+                        # (no real multi-task projection). Log so user can fix env/rollout propagation.
+                        self.log_warning(
+                            "PCGrad enabled but task_ids not in batch; using dummy task_id=0 for all samples. "
+                            "Ensure env exposes task_ids in obs and they are propagated through rollout."
+                        )
+                        n_samples = batch["prev_logprobs"].shape[0]
+                        task_ids = torch.zeros(
+                            n_samples, dtype=torch.long, device=batch["prev_logprobs"].device
+                        )
+                    else:
+                        task_ids = task_ids.long()
+                    # Flatten to 1D and align with batch size (one task_id per sample).
+                    n_samples = batch["prev_logprobs"].shape[0]
+                    task_ids = task_ids.flatten()
+                    if task_ids.numel() > n_samples:
+                        task_ids = task_ids[:n_samples]
+                    elif task_ids.numel() < n_samples:
+                        self.log_warning(
+                            f"task_ids length {task_ids.numel()} < batch size {n_samples}; padding with 0"
+                        )
+                        task_ids = torch.nn.functional.pad(
+                            task_ids, (0, n_samples - task_ids.numel()), value=0
+                        )
+
+                    kwargs_model = {}
                     if SupportedModel(self.cfg.actor.model.model_type) in [
                         SupportedModel.OPENVLA,
                         SupportedModel.OPENVLA_OFT,
                     ]:
-                        kwargs["temperature"] = (
+                        kwargs_model["temperature"] = (
                             self.cfg.algorithm.sampling_params.temperature_train
                         )
-                        kwargs["top_k"] = self.cfg.algorithm.sampling_params.top_k
+                        kwargs_model["top_k"] = self.cfg.algorithm.sampling_params.top_k
                     elif (
                         SupportedModel(self.cfg.actor.model.model_type)
                         == SupportedModel.GR00T
                     ):
-                        kwargs["prev_logprobs"] = prev_logprobs
+                        kwargs_model["prev_logprobs"] = prev_logprobs
 
                     compute_values = (
                         True if self.cfg.algorithm.adv_type == "gae" else False
@@ -1292,7 +1469,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             compute_entropy=self.cfg.algorithm.entropy_bonus > 0,
                             compute_values=compute_values,
                             use_cache=False,
-                            **kwargs,
+                            **kwargs_model,
                         )
 
                     if (
@@ -1301,63 +1478,149 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     ):
                         prev_logprobs = output_dict["prev_logprobs"]
 
-                    kwargs = {
-                        "loss_type": self.cfg.algorithm.loss_type,
-                        "logprob_type": self.cfg.algorithm.logprob_type,
-                        "reward_type": self.cfg.algorithm.reward_type,
-                        "single_action_dim": self.cfg.actor.model.get("action_dim", 7),
-                        "logprobs": output_dict["logprobs"],
-                        "values": output_dict.get("values", None),
-                        "old_logprobs": prev_logprobs,
-                        "advantages": advantages,
-                        "returns": returns,
-                        "prev_values": prev_values,
-                        "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
-                        "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
-                        "value_clip": self.cfg.algorithm.get("value_clip", None),
-                        "huber_delta": self.cfg.algorithm.get("huber_delta", None),
-                        "loss_mask": loss_mask,
-                        "loss_mask_sum": loss_mask_sum,
-                        "max_episode_steps": self.cfg.env.train.max_episode_steps,
-                        "task_type": self.cfg.runner.task_type,
-                        "critic_warmup": self.optimizer_steps
-                        < self.critic_warmup_steps,
-                    }
-                    loss, metrics_data = policy_loss(**kwargs)
+                    logprobs = output_dict["logprobs"]
+                    values = output_dict.get("values", None)
 
-                    entropy_loss = torch.tensor(0.0, device=torch.cuda.current_device())
-                    if (
-                        self.cfg.algorithm.entropy_bonus > 0
-                        and not kwargs["critic_warmup"]
-                    ):
-                        entropy = output_dict["entropy"]
-                        entropy = reshape_entropy(
-                            entropy,
-                            entropy_type=self.cfg.algorithm.entropy_type,
-                            action_dim=self.cfg.actor.model.get("action_dim", 7),
-                            batch_size=output_dict["logprobs"].shape[0],
+                    unique_task_ids = torch.unique(task_ids)
+                    per_task_grads: list[list[torch.Tensor | None]] = []
+                    per_task_losses = []
+
+                    params = [p for p in self.model.parameters() if p.requires_grad]
+
+                    for tid in unique_task_ids.tolist():
+                        mask = task_ids == tid
+                        if not mask.any():
+                            continue
+
+                        indices = mask.nonzero(as_tuple=False).squeeze(-1)
+
+                        logprobs_t = logprobs[indices]
+                        advantages_t = advantages[indices]
+                        prev_logprobs_t = prev_logprobs[indices]
+                        returns_t = returns[indices] if returns is not None else None
+                        prev_values_t = (
+                            prev_values[indices] if prev_values is not None else None
                         )
-                        entropy_loss = masked_mean(entropy, mask=loss_mask)
-                        loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
-                    metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()
+                        loss_mask_t = loss_mask[indices] if loss_mask is not None else None
 
-                    loss /= self.gradient_accumulation
-                    with backward_ctx:
-                        self.grad_scaler.scale(loss).backward()
+                        loss_kwargs = {
+                            "loss_type": self.cfg.algorithm.loss_type,
+                            "logprob_type": self.cfg.algorithm.logprob_type,
+                            "reward_type": self.cfg.algorithm.reward_type,
+                            "single_action_dim": self.cfg.actor.model.get(
+                                "action_dim", 7
+                            ),
+                            "logprobs": logprobs_t,
+                            "values": values[indices] if values is not None else None,
+                            "old_logprobs": prev_logprobs_t,
+                            "advantages": advantages_t,
+                            "returns": returns_t,
+                            "prev_values": prev_values_t,
+                            "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
+                            "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
+                            "value_clip": self.cfg.algorithm.get("value_clip", None),
+                            "huber_delta": self.cfg.algorithm.get(
+                                "huber_delta", None
+                            ),
+                            "loss_mask": loss_mask_t,
+                            "loss_mask_sum": None,
+                            "max_episode_steps": self.cfg.env.train.max_episode_steps,
+                            "task_type": self.cfg.runner.task_type,
+                            "critic_warmup": self.optimizer_steps
+                            < self.critic_warmup_steps,
+                        }
 
-                    metrics_data["actor/total_loss"] = loss.detach().item()
-                    append_to_dict(metrics, metrics_data)
+                        loss_t, _ = policy_loss(**loss_kwargs)
+                        per_task_losses.append(loss_t.detach())
 
-                torch.cuda.empty_cache()
+                        grads_t = torch.autograd.grad(
+                            loss_t,
+                            params,
+                            retain_graph=True,
+                            allow_unused=True,
+                        )
+                        per_task_grads.append(list(grads_t))
 
-                grad_norm, lr_list = self.optimizer_step()
-                data = {
-                    "actor/grad_norm": grad_norm,
-                    "actor/lr": lr_list[0],
-                }
-                if len(lr_list) > 1:
-                    data["critic/lr"] = lr_list[1]
-                append_to_dict(metrics, data)
+                    if not per_task_grads:
+                        continue
+
+                    projected_grads = apply_pcgrad(per_task_grads)
+
+                    # Compute and save pairwise cosine similarities between per-task gradients.
+                    try:
+                        task_grad_vecs = []
+                        for grads_per_task in per_task_grads:
+                            flat_list = []
+                            for g in grads_per_task:
+                                if g is None:
+                                    continue
+                                flat_list.append(g.reshape(-1))
+                            if len(flat_list) == 0:
+                                continue
+                            task_grad_vecs.append(torch.cat(flat_list))
+
+                        if len(task_grad_vecs) >= 2:
+                            grad_matrix = torch.stack(task_grad_vecs, dim=0).float()
+                            norms = grad_matrix.norm(dim=1, keepdim=True) + 1e-8
+                            grad_matrix = grad_matrix / norms
+                            cos_matrix = grad_matrix @ grad_matrix.transpose(0, 1)
+
+                            triu_idx = torch.triu_indices(
+                                cos_matrix.size(0), cos_matrix.size(1), offset=1
+                            )
+                            cos_values = cos_matrix[triu_idx[0], triu_idx[1]]
+                            cos_values_np = cos_values.detach().cpu().numpy()
+
+                            counts, bin_edges = np.histogram(
+                                cos_values_np, bins=50, range=(-1.0, 1.0)
+                            )
+
+                            log_base_dir = self.cfg.runner.logger.log_path
+                            exp_name = self.cfg.runner.logger.experiment_name
+                            save_dir = os.path.join(log_base_dir, exp_name, "grad_cos")
+                            os.makedirs(save_dir, exist_ok=True)
+
+                            global_step = getattr(self, "global_step", None)
+                            if global_step is None:
+                                file_name = f"pcgrad_cos_rank{self._rank}.npz"
+                            else:
+                                file_name = (
+                                    f"pcgrad_cos_step{int(global_step)}_rank{self._rank}.npz"
+                                )
+                            save_path = os.path.join(save_dir, file_name)
+                            np.savez(
+                                save_path,
+                                cos_values=cos_values_np,
+                                counts=counts,
+                                bin_edges=bin_edges,
+                            )
+                    except Exception as e:
+                        self.log_warning(
+                            f"Failed to record PCGrad cosine similarities: {e}"
+                        )
+
+                    # Assign projected gradients back to model parameters
+                    for p, g in zip(params, projected_grads):
+                        if g is None:
+                            continue
+                        if p.grad is None:
+                            p.grad = g.clone()
+                        else:
+                            p.grad.copy_(g)
+
+                    torch.cuda.empty_cache()
+
+                    grad_norm, lr_list = self.optimizer_step()
+
+                    # Basic metrics for PCGrad step
+                    data = {
+                        "actor/grad_norm": grad_norm,
+                        "actor/lr": lr_list[0],
+                        "actor/pcgrad_num_tasks": float(len(per_task_grads)),
+                    }
+                    if len(lr_list) > 1:
+                        data["critic/lr"] = lr_list[1]
+                    append_to_dict(metrics, data)
         # put LR scheduler step here
         self.lr_scheduler.step()
         self.optimizer.zero_grad()
