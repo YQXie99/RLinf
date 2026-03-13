@@ -95,6 +95,14 @@ def compute_evaluate_metrics(eval_metrics_list):
                 # 记录为 success_once/task_<id>，便于在 logger 中区分
                 mean_eval_metrics[f"success_once/task_{int(tid)}"] = task_success
 
+    # 统计每个任务在当前 batch 中出现的次数（按轨迹级别）
+    if "task_id" in all_eval_metrics:
+        task_ids = all_eval_metrics["task_id"].long()
+        unique_task_ids, counts = torch.unique(task_ids, return_counts=True)
+        for tid, cnt in zip(unique_task_ids.tolist(), counts.tolist()):
+            # 记录为 task_count/task_<id>
+            mean_eval_metrics[f"task_count/task_{int(tid)}"] = float(cnt)
+
     # Add total trajectory count to metrics
     mean_eval_metrics["num_trajectories"] = sum(trajectory_counts)
 

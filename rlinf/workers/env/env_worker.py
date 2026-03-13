@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from collections import defaultdict
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -239,13 +239,70 @@ class EnvWorker(Worker):
         chunk_action = np.concatenate(chunk_action, axis=0)
         return chunk_action
 
-    def finish_rollout(self, mode="train"):
+    def _build_epoch_env_stats_for_sampler(
+        self,
+        env_metrics: dict,
+        epoch: int,
+        n_chunk_steps: int,
+    ) -> Optional[dict[str, np.ndarray]]:
+        """Build epoch_env_stats (task_ids, successes) for task sampler update.
+
+        Used when env.train has task_sampler (e.g. MetaWorld success-rate adaptive).
+        """
+        if "task_id" not in env_metrics or not env_metrics["task_id"]:
+            return None
+        success_key = (
+            "success_at_end"
+            if self.cfg.env.train.ignore_terminations
+            else "success_once"
+        )
+        if success_key not in env_metrics or not env_metrics[success_key]:
+            return None
+        task_list = env_metrics["task_id"]
+        success_list = env_metrics[success_key]
+        auto_reset = self.cfg.env.train.auto_reset
+        ignore_terminations = self.cfg.env.train.ignore_terminations
+        if auto_reset or ignore_terminations:
+            # This epoch's entries are the last n_chunk_steps appends
+            start = len(task_list) - n_chunk_steps
+            start = max(0, start)
+            task_tensors = task_list[start:]
+            success_tensors = success_list[start:]
+            if not task_tensors:
+                return None
+            task_ids = torch.cat([t.ravel() for t in task_tensors], dim=0).cpu().numpy()
+            successes = (
+                torch.cat([s.ravel().float() for s in success_tensors], dim=0)
+                .cpu()
+                .numpy()
+            )
+        else:
+            # One value per epoch (overwritten)
+            if epoch < len(task_list):
+                task_ids = task_list[epoch].cpu().numpy().ravel()
+                successes = (
+                    success_list[epoch].float().cpu().numpy().ravel()
+                    if epoch < len(success_list)
+                    else np.zeros_like(task_ids, dtype=np.float64)
+                )
+            else:
+                return None
+        return {"task_ids": task_ids, "successes": successes}
+
+    def finish_rollout(
+        self, mode: str = "train", epoch_env_stats: Optional[dict] = None
+    ) -> None:
         # reset
         if mode == "train":
             for i in range(self.stage_num):
                 if self.cfg.env.train.video_cfg.save_video:
                     self.env_list[i].flush_video()
-                self.env_list[i].update_reset_state_ids()
+                if epoch_env_stats is not None:
+                    self.env_list[i].update_reset_state_ids(
+                        epoch_env_stats=epoch_env_stats
+                    )
+                else:
+                    self.env_list[i].update_reset_state_ids()
         elif mode == "eval":
             for i in range(self.stage_num):
                 if self.cfg.env.eval.video_cfg.save_video:
@@ -382,7 +439,14 @@ class EnvWorker(Worker):
                 (env_output.intervene_actions, env_output.intervene_flags)
                 for env_output in env_output_list
             ]
-            self.finish_rollout()
+
+            # Update task sampler (if enabled) and then refresh reset_state_ids
+            epoch_env_stats = None
+            if self.cfg.env.train.get("task_sampler") is not None:
+                epoch_env_stats = self._build_epoch_env_stats_for_sampler(
+                    env_metrics, epoch, n_chunk_steps
+                )
+            self.finish_rollout(epoch_env_stats=epoch_env_stats)
 
         for env in self.env_list:
             if self.enable_offload and hasattr(env, "close"):

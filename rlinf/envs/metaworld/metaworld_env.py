@@ -25,6 +25,10 @@ import numpy as np
 import torch
 
 from rlinf.envs.metaworld import MetaWorldBenchmark
+from rlinf.envs.metaworld.task_sampler import (
+    BaseTaskSampler,
+    SuccessRateAdaptiveSampler,
+)
 from rlinf.envs.metaworld.venv import ReconfigureSubprocEnv
 from rlinf.envs.utils import (
     list_of_dict_to_dict_of_list,
@@ -79,6 +83,8 @@ class MetaWorldEnv(gym.Env):
 
         self._init_metrics()
         self._elapsed_steps = np.zeros(self.num_envs, dtype=np.int32)
+
+        self.task_sampler: Optional[BaseTaskSampler] = self._create_task_sampler(cfg)
 
         self.video_cfg = cfg.video_cfg
         self.video_cnt = 0
@@ -147,9 +153,36 @@ class MetaWorldEnv(gym.Env):
             self.total_num_group_envs += self.task_num_trials
         self.cumsum_trial_id_bins = np.cumsum(self.trial_id_bins)
 
-    def update_reset_state_ids(self):
+    def _create_task_sampler(self, cfg) -> Optional[BaseTaskSampler]:
+        """Create task sampler from config if present (train only)."""
+        if cfg.is_eval:
+            return None
+        sampler_cfg = cfg.get("task_sampler")
+        if sampler_cfg is None:
+            return None
+        name = sampler_cfg.get("name", "success_rate_adaptive")
+        if name == "success_rate_adaptive":
+            return SuccessRateAdaptiveSampler(
+                num_tasks=self.num_tasks,
+                alpha=float(sampler_cfg.get("alpha", 1.0)),
+                min_count=float(sampler_cfg.get("min_count", 1.0)),
+            )
+        return None
+
+    def update_reset_state_ids(
+        self, epoch_env_stats: Optional[dict] = None
+    ) -> None:
         if self.cfg.is_eval or self.cfg.use_ordered_reset_state_ids:
             reset_state_ids = self._get_ordered_reset_state_ids(self.num_group)
+        elif getattr(self, "task_sampler", None) is not None:
+            if epoch_env_stats is not None:
+                self.task_sampler.update(epoch_env_stats)
+            reset_state_ids = self.task_sampler.sample(
+                self.num_group,
+                rng=self._generator,
+                cumsum_trial_id_bins=self.cumsum_trial_id_bins,
+                task_num_trials=self.trial_id_bins,
+            )
         else:
             reset_state_ids = self._get_random_reset_state_ids(self.num_group)
         self.reset_state_ids = reset_state_ids.repeat(self.group_size)
@@ -315,8 +348,14 @@ class MetaWorldEnv(gym.Env):
             env_idx = np.arange(self.num_envs)
 
         if reset_state_ids is None:
-            num_reset_states = len(env_idx)
-            reset_state_ids = self._get_random_reset_state_ids(num_reset_states)
+            # When using fixed reset_state_ids (e.g. GRPO with group-wise sampling),
+            # prefer the precomputed ids instead of per-env random sampling so that
+            # group alignment is preserved from the very first reset.
+            if self.use_fixed_reset_state_ids and hasattr(self, "reset_state_ids"):
+                reset_state_ids = self.reset_state_ids[env_idx]
+            else:
+                num_reset_states = len(env_idx)
+                reset_state_ids = self._get_random_reset_state_ids(num_reset_states)
 
         self._reconfigure(reset_state_ids, env_idx)
 

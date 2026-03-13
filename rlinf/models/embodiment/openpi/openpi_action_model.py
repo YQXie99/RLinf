@@ -29,6 +29,7 @@ from openpi.models_pytorch.pi0_pytorch import PI0Pytorch, make_att_2d_masks
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.embodiment.modules.explore_noise_net import ExploreNoiseNet
 from rlinf.models.embodiment.modules.value_head import ValueHead
+from rlinf.models.embodiment.modules.popart import PopArtValueHead
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,10 @@ class OpenPi0Config(Pi0Config):
     add_value_head: bool = False  # add value head for ppo
     value_after_vlm: bool = False  # value after vlm, pi05 mode
     value_vlm_mode: str = "mean_token"  # last_token, mean_token, first_token
+    # PopArt config
+    use_popart: bool = False
+    popart_beta: float = 0.0001
+    num_tasks: int = 50
 
 
 class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
@@ -133,13 +138,22 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             else:
                 value_head_hidden_sizes = (512, 256, 128)
             value_head_activation = "relu"
-            self.value_head = ValueHead(
-                input_dim=proj_width,
-                hidden_sizes=value_head_hidden_sizes,
-                output_dim=1,
-                activation=value_head_activation,
-                bias_last=True,
-            )
+            if self.config.use_popart:
+                self.value_head = PopArtValueHead(
+                    input_dim=proj_width,
+                    hidden_sizes=value_head_hidden_sizes,
+                    num_tasks=self.config.num_tasks,
+                    beta=self.config.popart_beta,
+                    activation=value_head_activation,
+                )
+            else:
+                self.value_head = ValueHead(
+                    input_dim=proj_width,
+                    hidden_sizes=value_head_hidden_sizes,
+                    output_dim=1,
+                    activation=value_head_activation,
+                    bias_last=True,
+                )
         self.use_vlm_value = getattr(self.config, "value_after_vlm", False) and getattr(
             self.config, "add_value_head", False
         )
@@ -162,6 +176,78 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
     def set_global_step(self, global_step):
         self.global_step = global_step
 
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        """
+        Custom load_state_dict to handle shape mismatch when loading a checkpoint
+        trained without PopArt into a model with PopArt enabled.
+        """
+        if self.config.use_popart and self.config.add_value_head:
+            # Check for shape mismatch in value_head's last layer
+            last_layer_weight_key = "value_head.mlp.6.weight"
+            last_layer_bias_key = "value_head.mlp.6.bias"
+            
+            model_weight_shape = self.value_head.mlp[-1].weight.shape
+            
+            if last_layer_weight_key in state_dict:
+                ckpt_weight_shape = state_dict[last_layer_weight_key].shape
+                if ckpt_weight_shape != model_weight_shape:
+                    # Common case: checkpoint has a single-head critic [1, hidden]
+                    # while PopArt uses per-task heads [num_tasks, hidden].
+                    # Expand by repeating the single head across tasks to preserve
+                    # the pretrained critic initialization.
+                    if (
+                        len(ckpt_weight_shape) == 2
+                        and len(model_weight_shape) == 2
+                        and ckpt_weight_shape[0] == 1
+                        and ckpt_weight_shape[1] == model_weight_shape[1]
+                    ):
+                        num_tasks = model_weight_shape[0]
+                        state_dict[last_layer_weight_key] = state_dict[
+                            last_layer_weight_key
+                        ].repeat(num_tasks, 1)
+                        print(
+                            f"[PopArt] Expanding '{last_layer_weight_key}' from "
+                            f"{ckpt_weight_shape} to {tuple(state_dict[last_layer_weight_key].shape)} "
+                            f"by repeating single-head weights."
+                        )
+                    else:
+                        # Fallback: skip if the mismatch is not safely expandable.
+                        print(
+                            f"[PopArt] Skipping '{last_layer_weight_key}' due to shape mismatch: "
+                            f"checkpoint {ckpt_weight_shape} vs model {model_weight_shape}. "
+                            f"PopArt layer will use random initialization."
+                        )
+                        del state_dict[last_layer_weight_key]
+                    
+            if last_layer_bias_key in state_dict:
+                ckpt_bias_shape = state_dict[last_layer_bias_key].shape
+                model_bias_shape = self.value_head.mlp[-1].bias.shape
+                if ckpt_bias_shape != model_bias_shape:
+                    # Expand single-head bias [1] -> [num_tasks].
+                    if (
+                        len(ckpt_bias_shape) == 1
+                        and len(model_bias_shape) == 1
+                        and ckpt_bias_shape[0] == 1
+                    ):
+                        num_tasks = model_bias_shape[0]
+                        state_dict[last_layer_bias_key] = state_dict[
+                            last_layer_bias_key
+                        ].repeat(num_tasks)
+                        print(
+                            f"[PopArt] Expanding '{last_layer_bias_key}' from "
+                            f"{ckpt_bias_shape} to {tuple(state_dict[last_layer_bias_key].shape)} "
+                            f"by repeating single-head bias."
+                        )
+                    else:
+                        print(
+                            f"[PopArt] Skipping '{last_layer_bias_key}' due to shape mismatch: "
+                            f"checkpoint {ckpt_bias_shape} vs model {model_bias_shape}. "
+                            f"PopArt layer will use random initialization."
+                        )
+                        del state_dict[last_layer_bias_key]
+        
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
     def setup_wrappers(
         self,
         transforms: Sequence[_transforms.DataTransformFn] = (),
@@ -177,13 +263,17 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         if first_process:
             inputs.pop("prompt")
         else:
-            inputs = {key: inputs[key] for key in inputs.keys() if "/" in key}
+            inputs = {key: inputs[key] for key in inputs.keys() if "/" in key or key == "task_ids"}
 
         # tensor -> numpy
         inputs = jax.tree.map(
             lambda x: np.asarray(x.detach().cpu()) if torch.is_tensor(x) else x, inputs
         )
         batch_size = next(v.shape[0] for v in inputs.values() if hasattr(v, "shape"))
+        
+        # Save task_ids if present (avoid passing to transforms)
+        task_ids = inputs.pop("task_ids", None)
+
         # split & transform
         transformed_samples = []
         for i in range(batch_size):
@@ -210,6 +300,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             *transformed_samples,
         )
         # inputs = jax.tree.map(lambda *x: torch.stack(x, axis=0), inputs)
+        
+        if task_ids is not None:
+             # task_ids is numpy array. Recombine expects tensors.
+             task_ids_t = torch.from_numpy(np.asarray(task_ids).copy())
+             inputs["task_ids"] = task_ids_t
+
         if not first_process:
             inputs["tokenized_prompt"] = obs["tokenized_prompt"]
             inputs["tokenized_prompt_mask"] = obs["tokenized_prompt_mask"]
@@ -253,6 +349,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         compute_values = kwargs.get("compute_values", False)
         chains = forward_inputs["chains"]
         denoise_inds = forward_inputs["denoise_inds"]
+        task_ids = forward_inputs.get("task_ids") # Get task_ids if available
+
         # input transform
         observation = self.input_transform(forward_inputs, transpose=False)
         observation = _model.Observation.from_dict(observation)
@@ -264,6 +362,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         images = [img.to(device) for img in images]
         img_masks = [img_mask.to(device) for img_mask in img_masks]
         state = state.to(device)
+        
+        # Ensure task_ids on device
+        if task_ids is not None:
+            task_ids = task_ids.to(device)
+
         # get log prob
         log_probs, value_t, entropy = self.get_log_prob_value(
             images,
@@ -274,6 +377,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             chains,
             denoise_inds,
             compute_values,
+            task_ids=task_ids,
         )
         log_probs = log_probs[
             :, :, : self.config.action_chunk, : self.config.action_env_dim
@@ -311,6 +415,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         if env_obs["wrist_images"] is not None:
             processed_obs["observation/wrist_image"] = env_obs["wrist_images"]
         # store used keys
+        if "task_ids" in env_obs:
+            processed_obs["task_ids"] = env_obs["task_ids"]
         return processed_obs
 
     def precision_processor(self, processed_obs):
@@ -347,8 +453,20 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             processed_obs
         )  # obs precision processor
         observation = _model.Observation.from_dict(processed_obs)
+        
+        # Get task_ids for PopArt
+        task_ids = processed_obs.get("task_ids")
+        if task_ids is not None:
+            task_ids = task_ids.to(observation.state.device)
+            # Ensure task_ids is 1D (shape: [batch])
+            if task_ids.dim() > 1:
+                task_ids = task_ids.squeeze()
+            # Ensure task_ids is long type
+            if task_ids.dtype != torch.long:
+                task_ids = task_ids.long()
+        
         outputs = self.sample_actions(
-            observation, mode=mode, compute_values=compute_values
+            observation, mode=mode, compute_values=compute_values, task_ids=task_ids
         )
         actions = self.output_transform(
             {"actions": outputs["actions"], "state": observation.state}
@@ -381,6 +499,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         noise=None,
         mode="train",
         compute_values=True,
+        task_ids=None,
     ) -> torch.Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = observation.state.shape[0]
@@ -421,7 +540,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
         # add value based on the vlm for pi05, expert for pi0
         if self.use_vlm_value:
-            values_vlm = self.get_value_from_vlm(prefix_output)
+            values_vlm = self.get_value_from_vlm(prefix_output, task_ids=task_ids)
         if self.config.joint_logprob:
             initial_log_prob = self.get_logprob_norm(
                 x_t, torch.zeros_like(noise), torch.ones_like(noise)
@@ -463,6 +582,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 sample_mode,
                 num_steps,
                 compute_values,
+                task_ids=task_ids,
             )
             # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t_mean + self.sample_noise(x_t.shape, device) * x_t_std
@@ -507,6 +627,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         mode,
         denoise_steps,
         compute_values=True,
+        task_ids=None,
     ):
         """
         Sample the mean, variance and value of the action at a given timestep.
@@ -561,7 +682,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             # detach critic input
             if self.config.detach_critic_input:
                 suffix_out_value = suffix_out_value.detach()
-            value_t = self.value_head(suffix_out_value)[:, 0]
+            
+            # Check if value_head is PopArt by checking for the update_statistics method
+            if hasattr(self.value_head, 'update_statistics'):
+                value_t = self.value_head(suffix_out_value, task_ids=task_ids)
+            else:
+                value_t = self.value_head(suffix_out_value)[:, 0]
         else:
             value_t = torch.zeros((bsize), device=device)
         # ode sde mix sampling
@@ -679,6 +805,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         chains,
         denoise_inds,
         compute_values=False,
+        task_ids=None,
     ):
         bsize = state.shape[0]
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
@@ -729,6 +856,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 "train",
                 self.config.num_steps,
                 compute_values,
+                task_ids=task_ids,
             )
             log_probs = self.get_logprob_norm(chains_next, x_t_mean, x_t_std)
             entropy = self.gaussian_entropy(x_t_std)
@@ -737,7 +865,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             if not self.use_vlm_value:
                 chains_values.append(value_t)
         if self.use_vlm_value:
-            chains_values.append(self.get_value_from_vlm(prefix_output))
+            chains_values.append(self.get_value_from_vlm(prefix_output, task_ids=task_ids))
         chains_log_probs = torch.stack(chains_log_probs, dim=1)
         chains_values = torch.stack(chains_values, dim=1)
 
@@ -748,7 +876,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             chains_entropy = torch.zeros_like(chains_log_probs)
         return chains_log_probs, chains_values, chains_entropy
 
-    def get_value_from_vlm(self, prefix_output):
+    def get_value_from_vlm(self, prefix_output, task_ids=None):
         # prefix_output:
         # pi05: [bs, (256 * 3 + 200) = 968, 2048]
         # pi0: [bs, (256 * 3 + 48) = 816, 1024]
@@ -773,7 +901,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         prefix_out_value = prefix_output[:, prefix_mask, :]
         prefix_out_value = prefix_out_value.mean(dim=1, keepdim=False)
         prefix_out_value = prefix_out_value.to(dtype=torch.float32)
-        values_vlm = self.value_head(prefix_out_value)[:, 0]
+
+        # Check if value_head is PopArt by checking for the update_statistics method
+        if hasattr(self.value_head, 'update_statistics'):
+            values_vlm = self.value_head(prefix_out_value, task_ids=task_ids)
+        else:
+            values_vlm = self.value_head(prefix_out_value)[:, 0]
         return values_vlm
 
     def gaussian_entropy(self, sigma):
@@ -781,6 +914,16 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         sigma_safe = torch.where(mask, torch.ones_like(sigma), sigma)
         entropy = 0.5 * torch.log(2 * math.pi * math.e * (sigma_safe**2))
         return entropy
+
+    def get_popart_stats(self, task_ids):
+        if hasattr(self, "value_head") and hasattr(self.value_head, 'update_statistics'):
+            popart_layer = self.value_head.mlp[-1]
+            return popart_layer.mu[task_ids], popart_layer.sigma[task_ids]
+        return None, None
+
+    def update_popart_stats(self, targets, task_ids):
+        if hasattr(self, "value_head") and hasattr(self.value_head, 'update_statistics'):
+            self.value_head.update_statistics(targets, task_ids)
 
     def freeze_vlm(self):
         if self.config.train_expert_only:

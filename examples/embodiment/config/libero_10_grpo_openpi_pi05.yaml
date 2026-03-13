@@ -113,7 +113,7 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "/path/to/model/RLinf-Pi05-SFT"
+    model_path: /mnt/project_rlinf_hs/hyx/ckpts/liberopi05
     precision: ${actor.model.precision}
 
 actor:
@@ -126,7 +126,7 @@ actor:
 
   # Override the default values in model/pi0_5
   model:
-    model_path: "/path/to/model/RLinf-Pi05-SFT"
+    model_path: /mnt/project_rlinf_hs/hyx/ckpts/liberopi05
     num_steps: 4
 
   optim:

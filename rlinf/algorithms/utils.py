@@ -308,6 +308,20 @@ def preprocess_loss_inputs(
         old_logprobs = old_logprobs.reshape(bsz, -1, single_action_dim).sum(dim=[1, 2])
 
     target_shape = logprobs.shape
+    bsz_target = target_shape[0]
+
+    # For chunk-level rewards, prev_values from rollout may be per-step flattened
+    # (e.g. [bsz * T]) while current values are one per sample ([bsz]). Aggregate
+    # prev_values to [bsz] before expand_to_target_dim so critic loss sees matching shapes.
+    if (
+        reward_type == "chunk_level"
+        and prev_values is not None
+        and prev_values.dim() == 1
+        and prev_values.numel() != bsz_target
+        and prev_values.numel() % bsz_target == 0
+    ):
+        prev_values = prev_values.view(bsz_target, -1).mean(dim=1)
+
     advantages = expand_to_target_dim(advantages, target_shape)
     loss_mask = expand_to_target_dim(loss_mask, target_shape)
     loss_mask_sum = expand_to_target_dim(loss_mask_sum, target_shape)

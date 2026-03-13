@@ -770,6 +770,26 @@ def validate_embodied_cfg(cfg):
     with open_dict(cfg):
         # Optional multi-task gradient conflict handling (e.g., PCGrad)
         cfg.algorithm.use_pcgrad = cfg.algorithm.get("use_pcgrad", False)
+        cfg.algorithm.pcgrad_scope = cfg.algorithm.get("pcgrad_scope", "actor_critic")
+        if cfg.algorithm.use_pcgrad:
+            valid_scopes = ["actor", "critic", "actor_critic"]
+            assert (
+                cfg.algorithm.pcgrad_scope in valid_scopes
+            ), f"algorithm.pcgrad_scope must be one of {valid_scopes}, got {cfg.algorithm.pcgrad_scope}"
+            # Scope compatibility:
+            # - For PPO-style actor-critic (`loss_type == "actor_critic"`):
+            #   all scopes ["actor", "critic", "actor_critic"] are allowed.
+            # - For GRPO-style actor-only loss (`loss_type == "actor"`), we only
+            #   support applying PCGrad on the actor term, so scope must be "actor".
+            if cfg.algorithm.loss_type == "actor":
+                assert (
+                    cfg.algorithm.pcgrad_scope == "actor"
+                ), "When algorithm.loss_type == 'actor' (e.g., GRPO), algorithm.pcgrad_scope must be 'actor'."
+            if cfg.algorithm.pcgrad_scope in ("critic", "actor_critic"):
+                assert cfg.algorithm.loss_type == "actor_critic", (
+                    "algorithm.pcgrad_scope='critic' or 'actor_critic' is only supported "
+                    "when algorithm.loss_type == 'actor_critic'."
+                )
 
         weight_sync_interval = cfg.runner.get("weight_sync_interval", 1)
         assert weight_sync_interval > 0, "weight_sync_interval must be greater than 0"
