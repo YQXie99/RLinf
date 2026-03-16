@@ -20,9 +20,16 @@ import warnings
 import sys
 from typing import Optional, Union
 
+
 import gym
 import numpy as np
 import torch
+
+import glob
+import importlib
+import warnings
+import sys
+
 from omegaconf.omegaconf import OmegaConf
 
 libero_type = os.environ.get("LIBERO_TYPE", "standard")
@@ -52,6 +59,12 @@ if libero_type in ["pro", "plus"]:
     except ImportError as e:
         print(f"[Main Process Routing Error] Failed to import '{LIBERO_MAIN_MODULE_PATH}'. Error: {e}")
 
+if libero_type == "pro":
+    from liberopro.liberopro.benchmark import Benchmark
+elif libero_type == "plus":
+    from liberoplus.liberoplus.benchmark import Benchmark
+else:
+    from libero.libero.benchmark import Benchmark
 
 from rlinf.envs.libero.utils import (
     get_benchmark_overridden,
@@ -83,8 +96,8 @@ class LiberoEnv(gym.Env):
         self._generator_ordered = np.random.default_rng(seed=0)
         self.start_idx = 0
 
-        self.task_suite = get_benchmark_overridden(cfg.task_suite_name)()
-
+        self.task_suite: Benchmark = get_benchmark_overridden(cfg.task_suite_name)()
+        
         self._compute_total_num_group_envs()
         self.reset_state_ids_all = self.get_reset_state_ids_all()
         self.update_reset_state_ids()
@@ -449,11 +462,8 @@ class LiberoEnv(gym.Env):
             task_changed = self.task_ids[env_id] != task_ids[j]
             self.task_ids[env_id] = task_ids[j]
             self.trial_ids[env_id] = trial_ids[j]
-            
-
             if task_changed or not getattr(self.cfg, "is_eval", False):
                 reconfig_env_idx.append(env_id)
-        
         if reconfig_env_idx:
             env_fn_params = self.get_env_fn_params(reconfig_env_idx)
             self.env.reconfigure_env_fns(env_fn_params, reconfig_env_idx)
@@ -462,10 +472,7 @@ class LiberoEnv(gym.Env):
         
 
         self.env.reset(id=env_idx)
-        
         variant = os.environ.get("LIBERO_TYPE", self.cfg.get("libero_variant", "standard") if hasattr(self.cfg, "get") else "standard")
-        
-
         if variant != "plus":
             init_state = self._get_reset_states(env_idx=env_idx)
             self.env.set_init_state(init_state=init_state, id=env_idx)
@@ -617,4 +624,4 @@ class LiberoEnv(gym.Env):
             return reward_diff
         else:
             return reward
-        
+       

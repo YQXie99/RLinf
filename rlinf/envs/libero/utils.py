@@ -154,7 +154,19 @@ def get_libero_image(obs: dict[str, np.ndarray]) -> np.ndarray:
     img = img[::-1, ::-1]  # rotate 180 degrees
     return img
 
-def get_libero_wrist_image(obs: dict[str, np.ndarray], resize_size: Union[int, tuple[int, int]] = 224) -> np.ndarray:
+def get_libero_wrist_image(
+    obs: dict[str, np.ndarray], resize_size: Union[int, tuple[int, int]] = 224
+) -> np.ndarray:
+    """
+    Extracts wrist camera image from observations and preprocesses it.
+
+    Args:
+        obs: Observation dictionary from LIBERO environment
+        resize_size: Target size for resizing
+
+    Returns:
+        Preprocessed wrist camera image as numpy array
+    """
     img = obs["robot0_eye_in_hand_image"]
     img = img[::-1, ::-1]  # rotate 180 degrees
     return img
@@ -193,7 +205,6 @@ def get_benchmark_overridden(benchmark_name) -> Benchmark:
     # Build aggregated task map once, preserving order and de-duplicating by task name
     aggregated_task_map: dict[str, benchmark.Task] = {}
     suites = getattr(benchmark, "libero_suites", [])
-    
     for suite_name in suites:
         suite_map = benchmark.task_maps.get(suite_name, {})
         for task_name, task in suite_map.items():

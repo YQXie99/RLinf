@@ -75,7 +75,6 @@ gym_new_venv_step_type = tuple[
 ]
 warnings.simplefilter("once", DeprecationWarning)
 
-
 def _worker(
     parent: connection.Connection,
     p: connection.Connection,
