@@ -93,6 +93,9 @@ class LiberoEnv(gym.Env):
 
         self.prev_step_reward = np.zeros(self.num_envs)
         self.use_rel_reward = cfg.use_rel_reward
+        # self.prev_step_reward = np.zeros(self.num_envs)
+        # self.use_rel_reward = cfg.use_rel_reward
+        self.use_step_penalty = getattr(cfg, "use_step_penalty", False)
 
         self._init_metrics()
         self._elapsed_steps = np.zeros(self.num_envs, dtype=np.int32)

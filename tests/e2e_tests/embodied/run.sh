@@ -6,6 +6,16 @@ tabs 4
 CONFIG=$1
 BACKEND=${2:-"egl"}
 
+# Set LIBERO variant for pro/plus e2e configs (CI and local runs can rely on this)
+case "$CONFIG" in
+  liberopro_*)
+    export LIBERO_TYPE=pro
+    ;;
+  liberoplus_*)
+    export LIBERO_TYPE=plus
+    ;;
+esac
+
 export MUJOCO_GL=${BACKEND}
 export PYOPENGL_PLATFORM=${BACKEND}
 export PYTHONPATH=${REPO_PATH}:$PYTHONPATH
