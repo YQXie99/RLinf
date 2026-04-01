@@ -436,7 +436,6 @@ class CNNPolicy(nn.Module, BasePolicy):
                 calculate_values=calculate_values,
             )
         )
-        chunk_actions = chunk_actions.cpu().numpy()
         forward_inputs = {"action": action}
 
         if return_obs:

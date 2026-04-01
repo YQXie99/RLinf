@@ -493,6 +493,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         # wrist image observation
         if env_obs["wrist_images"] is not None:
             processed_obs["observation/wrist_image"] = env_obs["wrist_images"]
+        # extra view image observation
+        if env_obs["extra_view_images"] is not None:
+            processed_obs["observation/extra_view_image"] = env_obs["extra_view_images"]
         # store used keys
         if "task_ids" in env_obs:
             processed_obs["task_ids"] = env_obs["task_ids"]
@@ -523,7 +526,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         mode: Literal["train", "eval"] = "train",
         compute_values=True,
         **kwargs,
-    ) -> tuple[np.ndarray, dict[str, Any]]:
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         to_process_obs = self.obs_processor(env_obs)  # env obs -> policy input obs
         processed_obs = self.input_transform(
             to_process_obs, transpose=False
@@ -573,7 +576,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             # Step 3: Extract actual actions for environment interaction
             real_actions = self.output_transform(
                 {"actions": outputs["actions"], "state": observation.state}
-            )["actions"].numpy()
+            )["actions"]
 
             # Return actual actions to environment, but forward_inputs stores noise.
             actions = real_actions
@@ -588,7 +591,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             )
             actions = self.output_transform(
                 {"actions": outputs["actions"], "state": observation.state}
-            )["actions"].numpy()
+            )["actions"]
             prev_logprobs = outputs["prev_logprobs"]
             prev_values = outputs["prev_values"]
             forward_action = None
