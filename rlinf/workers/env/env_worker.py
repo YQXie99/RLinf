@@ -18,7 +18,7 @@ from typing import Any, Optional, Literal
 
 import numpy as np
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from rlinf.data.embodied_io_struct import (
     ChunkStepResult,
@@ -33,6 +33,7 @@ from rlinf.envs.wrappers import RecordVideo
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.metric_utils import compute_split_num
+from rlinf.utils.nested_dict_process import update_nested_cfg
 from rlinf.utils.placement import HybridComponentPlacement
 
 
@@ -110,6 +111,8 @@ class EnvWorker(Worker):
             groups=[(self._group_name, list(range(self._world_size)))],
         )
 
+        self.update_env_cfg()
+
         train_env_cls = get_env_cls(self.cfg.env.train.env_type, self.cfg.env.train)
         eval_env_cls = get_env_cls(self.cfg.env.eval.env_type, self.cfg.env.eval)
 
@@ -128,6 +131,43 @@ class EnvWorker(Worker):
 
         if not self.only_eval:
             self._init_env()
+
+    def update_env_cfg(self):
+        # train env
+        train_override_cfgs = self.cfg.env.train.get("override_cfgs", None)
+        if train_override_cfgs is not None:
+            assert len(train_override_cfgs) > self._rank, (
+                f"{len(train_override_cfgs)=} > {self._rank=}"
+            )
+
+            general_train_override_cfg = OmegaConf.to_container(
+                self.cfg.env.train.get("override_cfg", {}), resolve=True
+            )
+            override_cfg = OmegaConf.to_container(
+                train_override_cfgs[self._rank], resolve=True
+            ).copy()
+
+            base_cfg = {}
+            base_cfg = update_nested_cfg(base_cfg, general_train_override_cfg)
+            base_cfg = update_nested_cfg(base_cfg, override_cfg)
+            setattr(self.cfg.env.train, "override_cfg", OmegaConf.create(base_cfg))
+
+        eval_override_cfgs = self.cfg.env.eval.get("override_cfgs", None)
+        if eval_override_cfgs is not None:
+            assert len(eval_override_cfgs) > self._rank, (
+                f"{len(eval_override_cfgs)=} > {self._rank=}"
+            )
+
+            general_eval_override_cfg = OmegaConf.to_container(
+                self.cfg.env.eval.get("override_cfg", {}), resolve=True
+            )
+            eval_override_cfg = OmegaConf.to_container(
+                eval_override_cfgs[self._rank], resolve=True
+            ).copy()
+            base_eval_cfg = {}
+            base_eval_cfg = update_nested_cfg(base_eval_cfg, general_eval_override_cfg)
+            base_eval_cfg = update_nested_cfg(base_eval_cfg, eval_override_cfg)
+            setattr(self.cfg.env.eval, "override_cfg", OmegaConf.create(base_eval_cfg))
 
     def _setup_env_and_wrappers(self, env_cls, env_cfg, num_envs_per_stage: int):
         env_list = []
@@ -205,14 +245,13 @@ class EnvWorker(Worker):
         )
 
     def _init_env(self):
-        if self.cfg.env.train.auto_reset:
-            for i in range(self.stage_num):
+        for i in range(self.stage_num):
+            if self.cfg.env.train.auto_reset:
                 extracted_obs, _ = self.env_list[i].reset()
                 self.last_obs_list.append(extracted_obs)
                 self.last_intervened_info_list.append((None, None))
-
-                if self.enable_offload and hasattr(self.env_list[i], "offload"):
-                    self.env_list[i].offload()
+            if self.enable_offload and hasattr(self.env_list[i], "offload"):
+                self.env_list[i].offload()
 
     @Worker.timer("env_interact_step")
     def env_interact_step(
@@ -739,6 +778,10 @@ class EnvWorker(Worker):
                         rewards=rewards,
                     )
                     self.rollout_results[stage_id].append_step_result(chunk_step_result)
+                    if rollout_result.save_flags is not None:
+                        self.rollout_results[stage_id].mark_last_step_with_flags(
+                            rollout_result.save_flags
+                        )
 
                     env_output, env_info = self.env_interact_step(
                         rollout_result.actions, stage_id
