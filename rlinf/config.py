@@ -827,6 +827,22 @@ def validate_embodied_cfg(cfg):
             "env.train.max_steps_per_rollout_epoch must be divisible by actor.model.num_action_chunks"
         )
 
+    def get_robot_control_mode(robot: str):
+        if robot == "panda-qpos":
+            return "pd_joint_delta_pos"
+        elif robot == "panda-ee-dpos":
+            return "pd_ee_delta_pos"
+        elif robot == "panda-ee-target-dpos":  # for GSEnv
+            return "pd_ee_target_delta_pose"
+        elif "google_robot_static" in robot:
+            return "arm_pd_ee_delta_pose_align_interpolate_by_planner_gripper_pd_joint_target_delta_pos_interpolate_by_planner"
+        elif "widowx" in robot:
+            return "arm_pd_ee_target_delta_pose_align2_gripper_pd_joint_pos"
+        elif "panda" in robot:
+            return "pd_ee_body_target_delta_pose_real_root_frame"
+        else:
+            raise NotImplementedError(f"Robot {robot} not supported")
+
     with open_dict(cfg):
         # Optional multi-task gradient conflict handling (e.g., PCGrad)
         cfg.algorithm.use_pcgrad = cfg.algorithm.get("use_pcgrad", False)
@@ -858,29 +874,36 @@ def validate_embodied_cfg(cfg):
             SupportedEnvType(cfg.env.train.env_type) == SupportedEnvType.MANISKILL
             or SupportedEnvType(cfg.env.eval.env_type) == SupportedEnvType.MANISKILL
         ):
-
-            def get_robot_control_mode(robot: str):
-                if robot == "panda-qpos":
-                    return "pd_joint_delta_pos"
-                elif robot == "panda-ee-dpos":
-                    return "pd_ee_delta_pos"
-                elif robot == "panda-ee-target-dpos":  # for GSEnv
-                    return "pd_ee_target_delta_pose"
-                elif "google_robot_static" in robot:
-                    return "arm_pd_ee_delta_pose_align_interpolate_by_planner_gripper_pd_joint_target_delta_pos_interpolate_by_planner"
-                elif "widowx" in robot:
-                    return "arm_pd_ee_target_delta_pose_align2_gripper_pd_joint_pos"
-                elif "panda" in robot:
-                    return "pd_ee_body_target_delta_pose_real_root_frame"
-                else:
-                    raise NotImplementedError(f"Robot {robot} not supported")
-
             cfg.env.train.init_params.control_mode = get_robot_control_mode(
                 cfg.actor.model.policy_setup
             )
             cfg.env.eval.init_params.control_mode = get_robot_control_mode(
                 cfg.actor.model.policy_setup
             )
+        elif cfg.env.train.get("env_type") == "mixed" or cfg.env.train.get(
+            "simulator_type"
+        ) == "mixed":
+            # Set control_mode for each maniskill entry in simulator_list
+            if hasattr(cfg.env.train, "simulator_list"):
+                for simulator_entry in cfg.env.train.simulator_list:
+                    st = getattr(simulator_entry, "env_type", None) or getattr(
+                        simulator_entry, "simulator_type", None
+                    )
+                    if st == "maniskill":
+                        if hasattr(simulator_entry, "init_params"):
+                            simulator_entry.init_params.control_mode = (
+                                get_robot_control_mode(cfg.actor.model.policy_setup)
+                            )
+            if hasattr(cfg.env.eval, "simulator_list"):
+                for simulator_entry in cfg.env.eval.simulator_list:
+                    st = getattr(simulator_entry, "env_type", None) or getattr(
+                        simulator_entry, "simulator_type", None
+                    )
+                    if st == "maniskill":
+                        if hasattr(simulator_entry, "init_params"):
+                            simulator_entry.init_params.control_mode = (
+                                get_robot_control_mode(cfg.actor.model.policy_setup)
+                            )
         elif (
             SupportedEnvType(cfg.env.train.env_type) == SupportedEnvType.BEHAVIOR
             or SupportedEnvType(cfg.env.eval.env_type) == SupportedEnvType.BEHAVIOR

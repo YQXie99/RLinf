@@ -13,13 +13,16 @@
 # limitations under the License.
 
 import asyncio
+import json
+import os
 from collections import defaultdict
-from typing import Any, Optional, Literal
+from typing import Any, Literal, Optional
 
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+from rlinf.config import SupportedModel, get_supported_model
 from rlinf.data.embodied_io_struct import (
     ChunkStepResult,
     EmbodiedRolloutResult,
@@ -28,7 +31,7 @@ from rlinf.data.embodied_io_struct import (
     Trajectory,
 )
 from rlinf.envs import get_env_cls
-from rlinf.envs.action_utils import prepare_actions
+from rlinf.envs.action_utils import normalize_openpi_state, prepare_actions
 from rlinf.envs.wrappers import RecordVideo
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.comm_mapping import CommMapper
@@ -79,6 +82,116 @@ class EnvWorker(Worker):
             // self.cfg.actor.model.num_action_chunks
         )
         self.actor_split_num = self.get_actor_split_num()
+        self.train_env_type = cfg.env.train.env_type
+        self.eval_env_type = cfg.env.eval.env_type
+        self.train_env_cfg = cfg.env.train
+        self.eval_env_cfg = cfg.env.eval
+        self.train_action_norm_stats = None
+        self.train_state_norm_stats = None
+        self.eval_action_norm_stats = None
+        self.eval_state_norm_stats = None
+
+    def _check_unnorm_key(
+        self, norm_stats: dict[str, Any], unnorm_key: Optional[str]
+    ) -> str:
+        if unnorm_key not in norm_stats and f"{unnorm_key}_no_noops" in norm_stats:
+            unnorm_key = f"{unnorm_key}_no_noops"
+        assert unnorm_key in norm_stats, (
+            f"Action un-norm key {unnorm_key} not found in VLA `norm_stats`!"
+        )
+
+        if unnorm_key is None:
+            if len(norm_stats) == 1:
+                unnorm_key = next(iter(norm_stats.keys()))
+            else:
+                raise ValueError(
+                    f"Your model was trained on more than one dataset, "
+                    f"please pass a `unnorm_key` from the following options to choose the statistics "
+                    f"used for un-normalizing actions: {list(norm_stats.keys())}"
+                )
+
+        if unnorm_key not in norm_stats:
+            if f"{unnorm_key}_no_noops" in norm_stats:
+                unnorm_key = f"{unnorm_key}_no_noops"
+            else:
+                available_keys = list(norm_stats.keys())
+                raise ValueError(
+                    f"Action un-norm key '{unnorm_key}' not found in norm_stats! "
+                    f"Available keys: {available_keys}. "
+                    f"Please check your configuration and use one of the available keys."
+                )
+
+        return unnorm_key
+
+    def _get_norm_stats(
+        self, stats_file_path: str, unnorm_key: Optional[str]
+    ) -> tuple[Any, Any]:
+        if not os.path.isfile(stats_file_path):
+            raise FileNotFoundError(
+                f"Stats file not found: {stats_file_path}. "
+                f"Please check the path in your configuration file."
+            )
+
+        with open(stats_file_path, "r") as f:
+            data = json.load(f)
+
+        if "norm_stats" in data:
+            norm_stats = data["norm_stats"]
+        else:
+            norm_stats = data
+
+        if "state" in norm_stats or "actions" in norm_stats or "action" in norm_stats:
+            if "state" in norm_stats:
+                state_norm_stats = norm_stats["state"]
+            else:
+                state_norm_stats = None
+            if "action" in norm_stats:
+                action_norm_stats = norm_stats["action"]
+            elif "actions" in norm_stats:
+                action_norm_stats = norm_stats["actions"]
+            else:
+                raise ValueError(
+                    f"Neither 'action' nor 'actions' key found in norm_stats file: {stats_file_path}"
+                )
+            return action_norm_stats, state_norm_stats
+
+        unnorm_key = self._check_unnorm_key(norm_stats, unnorm_key)
+        if "state" in norm_stats[unnorm_key]:
+            state_norm_stats = norm_stats[unnorm_key]["state"]
+        else:
+            state_norm_stats = None
+        if "action" in norm_stats[unnorm_key]:
+            action_norm_stats = norm_stats[unnorm_key]["action"]
+        else:
+            action_norm_stats = norm_stats[unnorm_key]["actions"]
+        return action_norm_stats, state_norm_stats
+
+    def _openpi_use_quantile_norm(self) -> bool:
+        op = getattr(self.cfg.actor.model, "openpi", None)
+        if op is None:
+            return False
+        return bool(getattr(op, "use_quantile_norm", False))
+
+    def _stats_config_path(self) -> str:
+        if (
+            hasattr(self.cfg.actor.model, "lora_path")
+            and self.cfg.actor.model.lora_path is not None
+        ):
+            return os.path.join(self.cfg.actor.model.lora_path, "config.json")
+        return os.path.join(self.cfg.actor.model.model_path, "config.json")
+
+    @staticmethod
+    def _env_cfg_is_mixed(env_cfg) -> bool:
+        return env_cfg.get("env_type") == "mixed" or env_cfg.get(
+            "simulator_type"
+        ) == "mixed"
+
+    @staticmethod
+    def _simulator_entry_env_type(entry) -> str:
+        et = getattr(entry, "env_type", None)
+        if et is not None:
+            return et
+        return entry.simulator_type
 
     def init_worker(self):
         self.dst_ranks = {
@@ -101,8 +214,6 @@ class EnvWorker(Worker):
             )
         self.log_info(f"Env worker initialized with dst_ranks: {self.dst_ranks}")
         self.log_info(f"Env worker initialized with src_ranks: {self.src_ranks}")
-        train_env_cls = get_env_cls(self.cfg.env.train.env_type, self.cfg.env.train)
-        eval_env_cls = get_env_cls(self.cfg.env.eval.env_type, self.cfg.env.eval)
 
         # This is a barrier to ensure all envs' initial setup upon import is done
         # Essential for RealWorld env to ensure initial ROS node setup is done
@@ -113,19 +224,102 @@ class EnvWorker(Worker):
 
         self.update_env_cfg()
 
-        train_env_cls = get_env_cls(self.cfg.env.train.env_type, self.cfg.env.train)
-        eval_env_cls = get_env_cls(self.cfg.env.eval.env_type, self.cfg.env.eval)
+        model_type = get_supported_model(self.cfg.actor.model.model_type)
+        if self._env_cfg_is_mixed(self.cfg.env.train):
+            train_simulator_id = self._rank % len(self.cfg.env.train.simulator_list)
+            eval_simulator_id = self._rank % len(self.cfg.env.eval.simulator_list)
+            self.train_env_type = self._simulator_entry_env_type(
+                self.cfg.env.train.simulator_list[train_simulator_id]
+            )
+            self.eval_env_type = self._simulator_entry_env_type(
+                self.cfg.env.eval.simulator_list[eval_simulator_id]
+            )
+
+            env_train_resolved = OmegaConf.to_container(
+                self.cfg.env.train, resolve=True
+            )
+            simulator_config = OmegaConf.to_container(
+                self.cfg.env.train.simulator_list[train_simulator_id], resolve=True
+            )
+            init_params = simulator_config.pop("init_params", None)
+            simulator_config.pop("env_type", None)
+            simulator_config.pop("simulator_type", None)
+            simulator_config.pop("unnorm_key", None)
+            simulator_config.pop("unnorm_key_file", None)
+            merged_dict = {**env_train_resolved, **simulator_config}
+            if init_params is not None:
+                merged_dict["init_params"] = init_params
+            self.train_env_cfg = OmegaConf.create(merged_dict)
+            self.train_env_cfg.env_type = self.train_env_type
+            train_env_cls = get_env_cls(self.train_env_type, self.train_env_cfg)
+
+            unnorm_key = self.cfg.env.train.simulator_list[
+                train_simulator_id
+            ].unnorm_key
+            unnorm_key_file = self.cfg.env.train.simulator_list[
+                train_simulator_id
+            ].unnorm_key_file
+            self.train_action_norm_stats, self.train_state_norm_stats = (
+                self._get_norm_stats(unnorm_key_file, unnorm_key)
+            )
+
+            env_eval_resolved = OmegaConf.to_container(self.cfg.env.eval, resolve=True)
+            simulator_config = OmegaConf.to_container(
+                self.cfg.env.eval.simulator_list[eval_simulator_id], resolve=True
+            )
+            init_params = simulator_config.pop("init_params", None)
+            simulator_config.pop("env_type", None)
+            simulator_config.pop("simulator_type", None)
+            simulator_config.pop("unnorm_key", None)
+            simulator_config.pop("unnorm_key_file", None)
+            merged_dict = {**env_eval_resolved, **simulator_config}
+            if init_params is not None:
+                merged_dict["init_params"] = init_params
+            self.eval_env_cfg = OmegaConf.create(merged_dict)
+            self.eval_env_cfg.env_type = self.eval_env_type
+            eval_env_cls = get_env_cls(self.eval_env_type, self.eval_env_cfg)
+
+            unnorm_key = self.cfg.env.eval.simulator_list[eval_simulator_id].unnorm_key
+            unnorm_key_file = self.cfg.env.eval.simulator_list[
+                eval_simulator_id
+            ].unnorm_key_file
+            self.eval_action_norm_stats, self.eval_state_norm_stats = (
+                self._get_norm_stats(unnorm_key_file, unnorm_key)
+            )
+        else:
+            self.train_env_type = self.cfg.env.train.env_type
+            self.eval_env_type = self.cfg.env.eval.env_type
+            self.train_env_cfg = self.cfg.env.train
+            self.eval_env_cfg = self.cfg.env.eval
+            train_env_cls = get_env_cls(self.train_env_type, self.train_env_cfg)
+            eval_env_cls = get_env_cls(self.eval_env_type, self.eval_env_cfg)
+
+            if model_type == SupportedModel.OPENPI:
+                unnorm_key = self.cfg.actor.model.unnorm_key
+                stats_path = self._stats_config_path()
+                self.train_action_norm_stats, self.train_state_norm_stats = (
+                    self._get_norm_stats(stats_path, unnorm_key)
+                )
+                self.eval_action_norm_stats, self.eval_state_norm_stats = (
+                    self.train_action_norm_stats,
+                    self.train_state_norm_stats,
+                )
+            else:
+                self.train_action_norm_stats = None
+                self.train_state_norm_stats = None
+                self.eval_action_norm_stats = None
+                self.eval_state_norm_stats = None
 
         if not self.only_eval:
             self.env_list = self._setup_env_and_wrappers(
                 env_cls=train_env_cls,
-                env_cfg=self.cfg.env.train,
+                env_cfg=self.train_env_cfg,
                 num_envs_per_stage=self.train_num_envs_per_stage,
             )
         if self.enable_eval:
             self.eval_env_list = self._setup_env_and_wrappers(
                 env_cls=eval_env_cls,
-                env_cfg=self.cfg.env.eval,
+                env_cfg=self.eval_env_cfg,
                 num_envs_per_stage=self.eval_num_envs_per_stage,
             )
 
@@ -248,6 +442,13 @@ class EnvWorker(Worker):
         for i in range(self.stage_num):
             if self.cfg.env.train.auto_reset:
                 extracted_obs, _ = self.env_list[i].reset()
+                if (
+                    "states" in extracted_obs
+                    and self.train_state_norm_stats is not None
+                ):
+                    extracted_obs["states"] = normalize_openpi_state(
+                        extracted_obs["states"], self.train_state_norm_stats
+                    )
                 self.last_obs_list.append(extracted_obs)
                 self.last_intervened_info_list.append((None, None))
             if self.enable_offload and hasattr(self.env_list[i], "offload"):
@@ -262,12 +463,15 @@ class EnvWorker(Worker):
         """
         chunk_actions = prepare_actions(
             raw_chunk_actions=chunk_actions,
-            env_type=self.cfg.env.train.env_type,
+            env_type=self.train_env_type,
             model_type=self.cfg.actor.model.model_type,
             num_action_chunks=self.cfg.actor.model.num_action_chunks,
             action_dim=self.cfg.actor.model.action_dim,
             policy=self.cfg.actor.model.get("policy_setup", None),
             wm_env_type=self.cfg.env.train.get("wm_env_type", None),
+            action_norm_stats=self.train_action_norm_stats,
+            use_openpi_unnormalize=None,
+            openpi_use_quantiles=self._openpi_use_quantile_norm(),
         )
         env_info = {}
 
@@ -278,6 +482,14 @@ class EnvWorker(Worker):
             extracted_obs = obs_list[-1] if obs_list else None
         if isinstance(infos_list, (list, tuple)):
             infos = infos_list[-1] if infos_list else None
+        if (
+            extracted_obs is not None
+            and "states" in extracted_obs
+            and self.train_state_norm_stats is not None
+        ):
+            extracted_obs["states"] = normalize_openpi_state(
+                extracted_obs["states"], self.train_state_norm_stats
+            )
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
         if not self.cfg.env.train.auto_reset:
             if self.cfg.env.train.ignore_terminations:
@@ -327,12 +539,15 @@ class EnvWorker(Worker):
         """
         chunk_actions = prepare_actions(
             raw_chunk_actions=raw_actions,
-            env_type=self.cfg.env.eval.env_type,
+            env_type=self.eval_env_type,
             model_type=self.cfg.actor.model.model_type,
             num_action_chunks=self.cfg.actor.model.num_action_chunks,
             action_dim=self.cfg.actor.model.action_dim,
             policy=self.cfg.actor.model.get("policy_setup", None),
             wm_env_type=self.cfg.env.eval.get("wm_env_type", None),
+            action_norm_stats=self.eval_action_norm_stats,
+            use_openpi_unnormalize=None,
+            openpi_use_quantiles=self._openpi_use_quantile_norm(),
         )
         env_info = {}
 
@@ -343,6 +558,14 @@ class EnvWorker(Worker):
             extracted_obs = obs_list[-1] if obs_list else None
         if isinstance(infos_list, (list, tuple)):
             infos = infos_list[-1] if infos_list else None
+        if (
+            extracted_obs is not None
+            and "states" in extracted_obs
+            and self.eval_state_norm_stats is not None
+        ):
+            extracted_obs["states"] = normalize_openpi_state(
+                extracted_obs["states"], self.eval_state_norm_stats
+            )
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
 
         if chunk_dones.any():
@@ -411,16 +634,20 @@ class EnvWorker(Worker):
 
         Used when env.train has task_sampler (e.g. MetaWorld success-rate adaptive).
         """
-        if "task_id" not in env_metrics or not env_metrics["task_id"]:
-            return None
+        task_key = "task_id"
         success_key = (
             "success_at_end"
             if self.cfg.env.train.ignore_terminations
             else "success_once"
         )
+        if self._env_cfg_is_mixed(self.cfg.env.train):
+            task_key = f"{self.train_env_type}/task_id"
+            success_key = f"{self.train_env_type}/{success_key}"
+        if task_key not in env_metrics or not env_metrics[task_key]:
+            return None
         if success_key not in env_metrics or not env_metrics[success_key]:
             return None
-        task_list = env_metrics["task_id"]
+        task_list = env_metrics[task_key]
         success_list = env_metrics[success_key]
         auto_reset = self.cfg.env.train.auto_reset
         ignore_terminations = self.cfg.env.train.ignore_terminations
@@ -648,6 +875,13 @@ class EnvWorker(Worker):
             for stage_id in range(self.stage_num):
                 self.env_list[stage_id].is_start = True
                 extracted_obs, infos = self.env_list[stage_id].reset()
+                if (
+                    "states" in extracted_obs
+                    and self.train_state_norm_stats is not None
+                ):
+                    extracted_obs["states"] = normalize_openpi_state(
+                        extracted_obs["states"], self.train_state_norm_stats
+                    )
                 dones = get_zero_dones()
                 terminations = dones.clone()
                 truncations = dones.clone()
@@ -687,6 +921,9 @@ class EnvWorker(Worker):
         self, env_metrics: dict[str, list], env_info: dict[str, Any], epoch: int
     ):
         for key, value in env_info.items():
+            if self._env_cfg_is_mixed(self.cfg.env.train):
+                key = f"{self.train_env_type}/{key}"
+
             if (
                 not self.cfg.env.train.auto_reset
                 and not self.cfg.env.train.ignore_terminations
@@ -872,6 +1109,13 @@ class EnvWorker(Worker):
                 for stage_id in range(self.stage_num):
                     self.eval_env_list[stage_id].is_start = True
                     extracted_obs, infos = self.eval_env_list[stage_id].reset()
+                    if (
+                        "states" in extracted_obs
+                        and self.eval_state_norm_stats is not None
+                    ):
+                        extracted_obs["states"] = normalize_openpi_state(
+                            extracted_obs["states"], self.eval_state_norm_stats
+                        )
                     env_output = EnvOutput(
                         obs=extracted_obs,
                         final_obs=infos["final_observation"]
@@ -898,7 +1142,12 @@ class EnvWorker(Worker):
                     )
 
                     for key, value in env_info.items():
-                        eval_metrics[key].append(value)
+                        mkey = (
+                            f"{self.eval_env_type}/{key}"
+                            if self._env_cfg_is_mixed(self.cfg.env.train)
+                            else key
+                        )
+                        eval_metrics[mkey].append(value)
 
                     if self.cfg.env.eval.auto_reset:
                         if (

@@ -62,21 +62,30 @@ def compute_evaluate_metrics(eval_metrics_list):
     Returns:
         dict: Aggregated metrics with mean values and trajectory count
     """
-    all_eval_metrics: dict[str, torch.Tensor | float] = {}
-    env_info_keys = eval_metrics_list[0].keys()
+    if not eval_metrics_list:
+        return {}
 
-    # Count trajectories from each process
-    # If num_trajectories is already in the metrics, use it; otherwise count from tensor shape
-    trajectory_counts = []
-    for eval_metrics in eval_metrics_list:
-        count = count_trajectories(eval_metrics)
-        trajectory_counts.append(count)
+    non_empty_metrics = [
+        metrics for metrics in eval_metrics_list if metrics and len(metrics) > 0
+    ]
+    if not non_empty_metrics:
+        return {}
 
+    env_info_keys = set().union(*(m.keys() for m in non_empty_metrics))
+    trajectory_counts = [
+        count_trajectories(eval_metrics) for eval_metrics in non_empty_metrics
+    ]
+
+    all_eval_metrics: dict[str, torch.Tensor] = {}
     # First, aggregate each raw metric by concatenation
     for env_info_key in env_info_keys:
-        all_eval_metrics[env_info_key] = torch.concat(
-            [eval_metrics[env_info_key] for eval_metrics in eval_metrics_list]
-        )
+        parts = [
+            eval_metrics[env_info_key]
+            for eval_metrics in non_empty_metrics
+            if env_info_key in eval_metrics
+        ]
+        if parts:
+            all_eval_metrics[env_info_key] = torch.concat(parts)
 
     # Compute overall mean for each metric
     mean_eval_metrics: dict[str, float] = {}

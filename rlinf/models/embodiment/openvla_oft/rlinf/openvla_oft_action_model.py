@@ -24,9 +24,7 @@ from prismatic.extern.hf.modeling_prismatic import (
     OpenVLAForActionPrediction as OpenVLAOFTForActionPrediction,
 )
 from prismatic.vla.constants import (
-    ACTION_PROPRIO_NORMALIZATION_TYPE,
     STOP_INDEX,
-    NormalizationType,
 )
 from transformers.generation import TopKLogitsWarper
 
@@ -52,15 +50,15 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         self.action_dim = action_dim
         self.num_action_chunks = num_action_chunks
 
-        self.unnorm_key = config.unnorm_key
-        if (
-            self.unnorm_key not in self.norm_stats
-            and f"{self.unnorm_key}_no_noops" in self.norm_stats
-        ):
-            self.unnorm_key = f"{self.unnorm_key}_no_noops"
-        assert self.unnorm_key in self.norm_stats, (
-            f"Action un-norm key {self.unnorm_key} not found in VLA `norm_stats`!"
-        )
+        # self.unnorm_key = config.unnorm_key
+        # if (
+        #     self.unnorm_key not in self.norm_stats
+        #     and f"{self.unnorm_key}_no_noops" in self.norm_stats
+        # ):
+        #     self.unnorm_key = f"{self.unnorm_key}_no_noops"
+        # assert self.unnorm_key in self.norm_stats, (
+        #     f"Action un-norm key {self.unnorm_key} not found in VLA `norm_stats`!"
+        # )
 
         if add_value_head:
             self.hidden_size = self.config.hidden_size
@@ -126,10 +124,10 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
 
         return multimodal_embeddings, multimodal_attention_mask
 
-    def _get_action_stats(self) -> dict[str, Any]:
-        """Get all the logged statistics for the given dataset."""
-        unnorm_key = self._check_unnorm_key(self.norm_stats, self.unnorm_key)
-        return self.norm_stats[unnorm_key]["action"]
+    # def _get_action_stats(self) -> dict[str, Any]:
+    #     """Get all the logged statistics for the given dataset."""
+    #     unnorm_key = self._check_unnorm_key(self.norm_stats, self.unnorm_key)
+    #     return self.norm_stats[unnorm_key]["action"]
 
     def _prepare_input_for_action_prediction(self, input_ids, attention_mask):
         """Prepares input for action prediction by adding necessary tokens"""
@@ -164,43 +162,43 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
 
         return input_ids, attention_mask
 
-    def _unnormalize_actions(self, normalized_actions, unnorm_key=None):
-        """Unnormalize actions using dataset statistics"""
-        action_norm_stats = self.get_action_stats(unnorm_key)
+    # def _unnormalize_actions(self, normalized_actions, unnorm_key=None):
+    #     """Unnormalize actions using dataset statistics"""
+    #     action_norm_stats = self.get_action_stats(unnorm_key)
 
-        if ACTION_PROPRIO_NORMALIZATION_TYPE == NormalizationType.BOUNDS:
-            mask = action_norm_stats.get(
-                "mask", np.ones_like(action_norm_stats["min"], dtype=bool)
-            )
-            action_high, action_low = (
-                np.array(action_norm_stats["max"]),
-                np.array(action_norm_stats["min"]),
-            )
-        elif ACTION_PROPRIO_NORMALIZATION_TYPE == NormalizationType.BOUNDS_Q99:
-            mask = action_norm_stats.get(
-                "mask", np.ones_like(action_norm_stats["q01"], dtype=bool)
-            )
-            action_high, action_low = (
-                np.array(action_norm_stats["q99"]),
-                np.array(action_norm_stats["q01"]),
-            )
-        else:
-            raise ValueError("Unsupported action/proprio normalization type detected!")
+    #     if ACTION_PROPRIO_NORMALIZATION_TYPE == NormalizationType.BOUNDS:
+    #         mask = action_norm_stats.get(
+    #             "mask", np.ones_like(action_norm_stats["min"], dtype=bool)
+    #         )
+    #         action_high, action_low = (
+    #             np.array(action_norm_stats["max"]),
+    #             np.array(action_norm_stats["min"]),
+    #         )
+    #     elif ACTION_PROPRIO_NORMALIZATION_TYPE == NormalizationType.BOUNDS_Q99:
+    #         mask = action_norm_stats.get(
+    #             "mask", np.ones_like(action_norm_stats["q01"], dtype=bool)
+    #         )
+    #         action_high, action_low = (
+    #             np.array(action_norm_stats["q99"]),
+    #             np.array(action_norm_stats["q01"]),
+    #         )
+    #     else:
+    #         raise ValueError("Unsupported action/proprio normalization type detected!")
 
-        action_dim = normalized_actions.shape[-1]
-        repeat_factor = action_dim // action_high.shape[0]
-        action_high = action_high.repeat(repeat_factor)
-        action_low = action_low.repeat(repeat_factor)
-        mask = mask * repeat_factor
+    #     action_dim = normalized_actions.shape[-1]
+    #     repeat_factor = action_dim // action_high.shape[0]
+    #     action_high = action_high.repeat(repeat_factor)
+    #     action_low = action_low.repeat(repeat_factor)
+    #     mask = mask * repeat_factor
 
-        actions = np.where(
-            mask,
-            0.5 * (normalized_actions + 1) * (action_high - action_low + 1e-8)
-            + action_low,
-            normalized_actions,
-        )
+    #     actions = np.where(
+    #         mask,
+    #         0.5 * (normalized_actions + 1) * (action_high - action_low + 1e-8)
+    #         + action_low,
+    #         normalized_actions,
+    #     )
 
-        return actions
+    #     return actions
 
     @torch.no_grad()
     def predict_action_batch(
@@ -399,9 +397,9 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         )  # [B, dim]
         normalized_actions = normalized_actions.reshape(-1, self.action_dim)
 
-        # Unnormalize predicted actions
-        actions = self._unnormalize_actions(normalized_actions, self.unnorm_key)
-        actions = actions.reshape(idxs.shape)
+        # # Unnormalize predicted actions
+        # actions = self._unnormalize_actions(normalized_actions, self.unnorm_key)
+        actions = normalized_actions.reshape(idxs.shape)
 
         action_logits = processed_logits_tensor
         action_logits[..., : self.vocab_size - self.config.n_action_bins] = -torch.inf
@@ -431,6 +429,12 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
             "forward_inputs": forward_inputs,
         }
 
+        # torch.save(forward_inputs, "forward_inputs.pt")
+        # torch.save(inputs, "inputs.pt")
+        # torch.save(chunk_actions, "chunk_actions.pt")
+        # torch.save(normalized_actions, "normalized_actions.pt")
+        # exit(0)
+
         return chunk_actions, result
 
     def preprocess_for_train(self, data):
@@ -450,9 +454,9 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         )
         self.bins = np.linspace(-1, 1, model_config.n_action_bins)
         self.bin_centers = (self.bins[:-1] + self.bins[1:]) / 2.0
-        action_norm_stats = self._get_action_stats()
-        self.min_action = np.array(action_norm_stats["q01"])
-        self.max_action = np.array(action_norm_stats["q99"])
+        # action_norm_stats = self._get_action_stats()
+        # self.min_action = np.array(action_norm_stats["q01"])
+        # self.max_action = np.array(action_norm_stats["q99"])
         self.action_scale = 1.0
 
         self.input_processor = input_processor
