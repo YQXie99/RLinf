@@ -17,10 +17,10 @@ import torch
 
 from rlinf.config import SupportedModel
 from rlinf.envs import SupportedEnvType
-from rlinf.models.embodiment.prismatic.constants import (
+from prismatic.vla.constants import (
     ACTION_PROPRIO_NORMALIZATION_TYPE,
-    NormalizationType,
 )
+from prismatic.vla.datasets.rlds.utils.data_utils import NormalizationType
 
 
 def prepare_actions_for_maniskill(
